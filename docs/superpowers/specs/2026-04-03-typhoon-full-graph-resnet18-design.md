@@ -22,6 +22,37 @@ Compile fixed-shape `resnet18.onnx` (`1x3x224x224`, `float32`, `NCHW`) into Typh
 - Current recognition metadata reports `recognized_scope = "stem"`.
 - This design upgrades the scope from local subgraph lowering to full-graph Typhoon lowering.
 
+## Canonical Input Model Contract
+
+This design is intentionally pinned to the local fixed-shape model artifact used by the current tests:
+
+- model path convention: `~/model/resnet18.onnx` or `TYPHOON_RESNET18_ONNX_PATH`
+- input shape: `1x3x224x224`
+- dtype: `float32`
+- layout: `NCHW`
+
+The supported graph contract is the canonical graph observed from the current artifact after import through:
+
+1. `from_onnx(..., keep_params_in_input=True)`
+2. `relax.transform.DecomposeOpsForInference()`
+3. `relax.transform.LegalizeOps()`
+4. `relax.get_pipeline("default")`
+
+The local ONNX artifact does not contain `BatchNormalization` nodes. Batch norm is therefore treated as already folded away upstream of Typhoon recognition and lowering. Supporting ONNX variants with explicit batch norm is out of scope for this design and should fail early instead of silently broadening recognition.
+
+The canonical high-level operator family for the supported artifact is:
+
+- `Conv`
+- `Relu`
+- `Identity`
+- `Add`
+- `MaxPool`
+- `GlobalAveragePool`
+- `Flatten`
+- `Gemm`
+
+The Typhoon full-graph recognizer may operate on the canonicalized Relax/TIR form of this graph, but it must remain contractually tied to this artifact family rather than claim support for arbitrary ResNet18 exporter variants.
+
 ## Recommended Approach
 
 Use a staged full-graph approach:
@@ -73,6 +104,8 @@ For each region assignment, the planner must record enough metadata to validate 
 - consuming layer/task window
 - last use
 - reuse point
+
+`WGT` regions represent staged SRAM residency for the current layer or tile, not full-model persistent SRAM residency. Weight data may be reloaded into SRAM across layers and tiles through explicit DMA tasks, and the planner should treat weight residency as streamable unless a specific optimization chooses to keep a weight tile resident longer.
 
 Special handling is required for residual blocks:
 
