@@ -10,6 +10,27 @@
 
 ---
 
+## Shared Metadata Contract
+
+The three new Typhoon compiler passes must communicate through explicit module attributes so they
+can be implemented and tested independently.
+
+- `typhoon_resnet18_plan`
+  Produced by the pattern-identification pass.
+  Carries a serialized plan describing the recognized fixed-shape ResNet18 layer/block structure,
+  the canonicalized per-layer operator kind, and the logical tensor/layout requirements needed by
+  later passes.
+- `typhoon_sram_plan`
+  Produced by the SRAM planner.
+  Carries the fixed reusable region-pool assignment, compile-time tile choices, and per-layer/per-
+  tile region reuse schedule.
+- `typhoon_graph_plan`
+  Optional internal attribute produced by the graph builder if needed for debugging or test
+  assertions, but the authoritative emitted result is the resulting `tirx.typhoon.*` IR itself.
+
+Use one concrete serialized format consistently across these passes, such as JSON carried in a
+module attribute. Do not invent a different schema in each task.
+
 ## File Structure
 
 ### Existing Files To Modify
@@ -109,9 +130,10 @@ The pass should:
 
 - only activate for `target.kind.name == "typhoon"`
 - inspect the post-generic-lowering TIR form
+- own any Typhoon-specific canonicalization needed to reach the matchable TIR shape
 - reject unsupported structure early
 - require input shape `1 x 3 x 224 x 224`
-- store a plan object or serialized plan metadata on the module for later passes
+- store the recognized result in a stable module attribute named `typhoon_resnet18_plan`
 
 - [ ] **Step 5: Run the scope-gate test slice to verify it passes**
 
@@ -129,6 +151,7 @@ git commit -m "feat: identify typhoon resnet18 patterns"
 
 **Files:**
 - Create: `src/tirx/transform/plan_typhoon_sram.cc`
+- Modify: `python/tvm/tirx/transform/transform.py`
 - Test: `tests/python/tirx-transform/test_tir_transform_plan_typhoon_sram.py`
 
 - [ ] **Step 1: Write the failing SRAM planning tests**
@@ -159,19 +182,30 @@ The planner must:
 - assume `float32` only
 - fix `m0 = n0 = k0 = 8`
 - fix `Mt = Nt = Kt = 64`
-- assign static `ACT/WGT/COL/AUX` regions
+- consume `typhoon_resnet18_plan`
+- assign a fixed reusable `ACT/WGT/COL/AUX` region pool
 - support fixed double-buffering for selected activation/weight paths
 - reject any plan that exceeds `1MB`
+- store the result in a stable module attribute named `typhoon_sram_plan`
 
-- [ ] **Step 4: Run the SRAM planning tests to verify they pass**
+- [ ] **Step 4: Export the planner to Python**
+
+Expose a new transform entrypoint:
+
+```python
+def PlanTyphoonSRAM():
+    return _ffi_api.PlanTyphoonSRAM()  # type: ignore
+```
+
+- [ ] **Step 5: Run the SRAM planning tests to verify they pass**
 
 Run: `env PYTHONPATH=/home/ayd/code/tvm/python TVM_LIBRARY_PATH=/home/ayd/code/tvm/build python -m pytest -p no:tvm.testing.plugin tests/python/tirx-transform/test_tir_transform_plan_typhoon_sram.py -v`
 Expected: PASS
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
-git add src/tirx/transform/plan_typhoon_sram.cc tests/python/tirx-transform/test_tir_transform_plan_typhoon_sram.py
+git add src/tirx/transform/plan_typhoon_sram.cc python/tvm/tirx/transform/transform.py tests/python/tirx-transform/test_tir_transform_plan_typhoon_sram.py
 git commit -m "feat: plan typhoon sram for resnet18"
 ```
 
@@ -276,8 +310,8 @@ Expected: FAIL because the emission pass does not exist yet.
 
 The pass must:
 
-- consume the recognition + SRAM-plan metadata
-- emit tile-granular `region_decl`
+- consume `typhoon_resnet18_plan` and `typhoon_sram_plan`
+- emit fixed reusable `region_decl` statements for the planned region pool
 - emit `task_dma`, `task_matmul`, `task_vector`, `task_reshape`
 - emit one graph submission per generated function
 
@@ -388,7 +422,49 @@ git add tests/python/relax/test_relax_typhoon_resnet18.py
 git commit -m "test: add typhoon resnet18 relax coverage"
 ```
 
-## Task 7: Run Full Focused Verification
+## Task 7: Add Full-Model Simulator Execution And Numerical Validation
+
+**Files:**
+- Modify: `tests/python/relax/test_relax_typhoon_resnet18.py`
+
+- [ ] **Step 1: Extend the end-to-end Relax test with simulator execution**
+
+```python
+def test_relax_resnet18_runs_in_typhoon_simulator(tmp_path):
+    model_path = get_resnet18_model_path()
+    ex = compile_resnet18_to_typhoon(model_path)
+    output = run_resnet18_in_typhoon_simulator(ex, input_shape=(1, 3, 224, 224))
+    ref = run_reference_resnet18(model_path, input_shape=(1, 3, 224, 224))
+    np.testing.assert_allclose(output, ref, rtol=1e-4, atol=1e-4)
+```
+
+- [ ] **Step 2: Run the simulator-execution test to verify it fails**
+
+Run: `env PYTHONPATH=/home/ayd/code/tvm/python TVM_LIBRARY_PATH=/home/ayd/code/tvm/build python -m pytest -p no:tvm.testing.plugin tests/python/relax/test_relax_typhoon_resnet18.py -k 'runs_in_typhoon_simulator' -v`
+Expected: FAIL until the full-model graph both compiles and executes correctly through the simulator.
+
+- [ ] **Step 3: Implement the minimal harness and any missing fixes**
+
+The test must:
+
+- run the compiled model through the Typhoon simulator path
+- collect the actual output tensor
+- compare against a reference result
+- verify the compiled source still contains `TVMTyphoon*` calls
+
+- [ ] **Step 4: Run the simulator-execution test to verify it passes**
+
+Run: `env PYTHONPATH=/home/ayd/code/tvm/python TVM_LIBRARY_PATH=/home/ayd/code/tvm/build python -m pytest -p no:tvm.testing.plugin tests/python/relax/test_relax_typhoon_resnet18.py -v`
+Expected: PASS
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add tests/python/relax/test_relax_typhoon_resnet18.py
+git commit -m "test: validate typhoon resnet18 simulator execution"
+```
+
+## Task 8: Run Full Focused Verification
 
 **Files:**
 - Test-only verification task
