@@ -82,12 +82,18 @@ The first-stage TIR representation will treat the following concepts as first-cl
 
 SRAM is represented as explicit static regions:
 
+- `region_id`
 - `offset`
 - `size`
 - `alignment`
 - `tag`
 
 These regions represent physical address intervals in the fixed 1MB SRAM space.
+
+Tasks must reference SRAM through `region_id`, not through raw `offset/size` pairs and not through
+generic TIR `Buffer` objects alone. The region table is therefore the single source of truth for
+physical SRAM layout in the graph. Lowering may still carry underlying buffer handles for global
+memory arguments, but compute-side SRAM operands are expressed in terms of declared regions.
 
 ### 2. Task Nodes
 
@@ -116,8 +122,8 @@ Every task descriptor must contain at least:
 
 - `task_id`
 - `kind`
-- input regions or buffers
-- output regions or buffers
+- input region references or global-memory endpoints
+- output region references or global-memory endpoints
 - data type
 - shape/workload parameters
 - dependency list
@@ -129,14 +135,13 @@ Minimum fields per task kind:
 
 - direction: `global_to_sram` or `sram_to_global`
 - byte count
-- source buffer/address
-- destination buffer/address
-- referenced SRAM region
+- source global endpoint or source `region_id`
+- destination global endpoint or destination `region_id`
 
 ### Matmul
 
-- input regions for `A` and `B`
-- output region for `C`
+- input `region_id` for `A` and `B`
+- output `region_id` for `C`
 - `M`, `N`, `K`
 - layout metadata
 - data type
@@ -144,13 +149,13 @@ Minimum fields per task kind:
 ### Vector
 
 - vector op kind
-- input/output regions
+- input/output `region_id`
 - element count
 - data type
 
 ### Reshape
 
-- input/output regions
+- input/output `region_id`
 - total element count
 - layout or stride transform metadata
 
@@ -172,6 +177,15 @@ Scheduling rules:
 - On start, the simulator records `start_time`
 - On completion, the simulator records `end_time`
 - Resource occupancy lasts for the full simulated latency of the task
+
+The scheduler must be deterministic. If multiple tasks become ready for the same resource at the
+same simulated timestamp, the tie-break rule is:
+
+1. smaller `task_id` first
+2. if needed, stable creation order as the secondary key
+
+The same deterministic ordering rule should be used anywhere the simulator must choose between
+multiple equally-ready tasks. Determinism is required for repeatable traces and tests.
 
 This allows legal overlap such as:
 
@@ -257,6 +271,14 @@ The compiler side should perform at least the following checks:
 The first-stage implementation may use conservative checks. It does not need full symbolic memory
 provenance.
 
+For initialization tracking, the minimum rules are:
+
+- `global_to_sram DMA` initializes the destination SRAM region
+- compute tasks initialize their declared output SRAM regions
+- `sram_to_global DMA` does not initialize SRAM; it only consumes SRAM input
+- a task may read an SRAM region only if that region is an input graph region explicitly marked as
+  preinitialized, or if it is initialized by an earlier dependency chain
+
 ### Runtime Checks
 
 The runtime simulator should still perform defensive validation:
@@ -304,12 +326,44 @@ Define Typhoon-specific graph-construction intrinsics for:
 - graph submission
 - whole-graph completion wait
 
+The first-stage API should use a minimal, explicit graph-builder shape. Strawman intrinsic surface:
+
+- `typhoon.region_decl(region_id, offset, size, alignment, tag)`
+- `typhoon.task_dma(task_id, direction, src, dst, bytes, dep_task_ids...)`
+- `typhoon.task_matmul(task_id, a_region_id, b_region_id, c_region_id, m, n, k, dtype, layout, dep_task_ids...)`
+- `typhoon.task_vector(task_id, op_kind, in0_region_id, in1_region_id, out_region_id, elem_count, dtype, dep_task_ids...)`
+- `typhoon.task_reshape(task_id, in_region_id, out_region_id, elem_count, transform_desc, dep_task_ids...)`
+- `typhoon.submit_graph(graph_id)`
+- `typhoon.wait_graph(graph_id)`
+
+The exact spelling may change during implementation, but the model should stay explicit:
+
+- regions are declared before use
+- tasks refer to SRAM by `region_id`
+- dependencies are part of task construction
+- one graph is submitted once
+
 ### Lowering/Codegen Layer
 
 Lower the Typhoon intrinsics into runtime API calls in host-executable generated code.
 
 The first stage should reuse host-side code generation, rather than introducing a dedicated binary
 device module format.
+
+The runtime boundary should also be explicit. A strawman runtime API shape is:
+
+- `TyphoonGraphBegin(ctx, graph_id)`
+- `TyphoonDeclareRegion(ctx, graph_id, region_id, offset, size, alignment, tag)`
+- `TyphoonAddDMATask(ctx, graph_id, task_desc)`
+- `TyphoonAddMatmulTask(ctx, graph_id, task_desc)`
+- `TyphoonAddVectorTask(ctx, graph_id, task_desc)`
+- `TyphoonAddReshapeTask(ctx, graph_id, task_desc)`
+- `TyphoonSubmitGraph(ctx, graph_id)`
+- `TyphoonWaitGraph(ctx, graph_id)`
+
+`task_desc` may be represented either as an explicit runtime struct or as flattened arguments in
+the first implementation. The important constraint for planning is that the compiler/runtime
+boundary be defined around graph construction and submission, not around immediate task execution.
 
 ### Runtime Layer
 
