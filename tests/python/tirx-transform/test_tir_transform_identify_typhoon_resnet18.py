@@ -21,13 +21,27 @@ import pytest
 import tvm
 
 
-def _make_mod(input_shape, output_shape):
+def _make_body(input_buffer, output_buffer, body_kind):
+    if body_kind == "stem":
+        return tvm.tirx.BufferStore(
+            output_buffer, tvm.tirx.BufferLoad(input_buffer, [0, 0, 0, 0]), [0, 0, 0, 0]
+        )
+    if body_kind == "trivial":
+        return tvm.tirx.Evaluate(0)
+    raise ValueError(f"Unsupported body_kind: {body_kind}")
+
+
+def _make_func(input_shape, output_shape, target_kind="typhoon", body_kind="stem"):
     input_buffer = tvm.tirx.decl_buffer(input_shape, "float32", name="input")
     output_buffer = tvm.tirx.decl_buffer(output_shape, "float32", name="output")
-    func = tvm.tirx.PrimFunc([input_buffer, output_buffer], tvm.tirx.Evaluate(0)).with_attr(
-        "target", tvm.target.Target({"kind": "typhoon"})
+    body = _make_body(input_buffer, output_buffer, body_kind)
+    return tvm.tirx.PrimFunc([input_buffer, output_buffer], body).with_attr(
+        "target", tvm.target.Target({"kind": target_kind})
     )
-    return tvm.IRModule.from_expr(func)
+
+
+def _make_mod(input_shape, output_shape, target_kind="typhoon", body_kind="stem"):
+    return tvm.IRModule.from_expr(_make_func(input_shape, output_shape, target_kind, body_kind))
 
 
 def build_non_resnet18_tir_module():
@@ -38,9 +52,44 @@ def build_resnet18_stem_tir_module():
     return _make_mod((1, 3, 224, 224), (1, 64, 112, 112))
 
 
+def build_non_typhoon_resnet18_stem_module():
+    return _make_mod((1, 3, 224, 224), (1, 64, 112, 112), target_kind="llvm")
+
+
+def build_trivial_body_resnet18_stem_module():
+    return _make_mod((1, 3, 224, 224), (1, 64, 112, 112), body_kind="trivial")
+
+
 def test_typhoon_resnet18_rejects_non_resnet18_graph():
     mod = build_non_resnet18_tir_module()
     with pytest.raises(ValueError, match="ResNet18"):
+        tvm.tirx.transform.IdentifyTyphoonResNet18()(mod)
+
+
+def test_typhoon_resnet18_ignores_non_typhoon_modules():
+    mod = build_non_typhoon_resnet18_stem_module()
+    out = tvm.tirx.transform.IdentifyTyphoonResNet18()(mod)
+    assert "typhoon_resnet18_plan" not in out.attrs
+
+
+def test_typhoon_resnet18_rejects_trivial_body_with_stem_shapes():
+    mod = build_trivial_body_resnet18_stem_module()
+    with pytest.raises(ValueError, match="ResNet18"):
+        tvm.tirx.transform.IdentifyTyphoonResNet18()(mod)
+
+
+def test_typhoon_resnet18_rejects_modules_with_multiple_typhoon_funcs():
+    mod = tvm.IRModule(
+        {
+            "main": _make_func((1, 3, 224, 224), (1, 64, 112, 112)).with_attr(
+                "global_symbol", "main"
+            ),
+            "aux": _make_func((1, 3, 224, 224), (1, 64, 112, 112)).with_attr(
+                "global_symbol", "aux"
+            ),
+        }
+    )
+    with pytest.raises(ValueError, match="single|ResNet18"):
         tvm.tirx.transform.IdentifyTyphoonResNet18()(mod)
 
 
@@ -51,6 +100,8 @@ def test_typhoon_resnet18_accepts_fixed_shape_resnet18_conv_stem():
 
     plan = json.loads(out.attrs["typhoon_resnet18_plan"])
     assert plan["model"] == "resnet18"
+    assert plan["recognized_scope"] == "stem"
     assert plan["input_shape"] == [1, 3, 224, 224]
     assert plan["dtype"] == "float32"
     assert plan["layers"][0]["op_name"] == "stem_conv"
+    assert plan["layers"][0]["block_id"] == 0
