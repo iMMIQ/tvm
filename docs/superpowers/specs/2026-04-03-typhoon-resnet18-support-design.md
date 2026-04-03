@@ -259,6 +259,29 @@ Region reuse is static and template-driven:
 The primary success criterion is correct explicit SRAM planning for the fixed ResNet18 workload, not
  global optimality.
 
+### Compile-Time Tiling Contract
+
+This stage requires compile-time tiling.
+
+Neither `conv2d` nor `dense` is executed as a whole-layer task. Both are lowered into tile-granular
+task sequences.
+
+For `float32`, the stage-1 fixed matmul tile is:
+
+- `Mt = 64`
+- `Nt = 64`
+- `Kt = 64`
+
+This is a fixed planning contract for the first implementation, not a search space.
+
+Implications:
+
+- each `task_matmul` handles one `64 x 64 x 64` tile, with edge tiles cropped at boundaries
+- `im2col` is also performed tile-by-tile
+- SRAM region planning, dependency structure, and task counts are defined around these compile-time
+  tiles
+- the first stage does not introduce an autotuned or per-layer tile policy
+
 ## Task-DAG Construction
 
 Each major model layer expands into a sequence of Typhoon tasks.
@@ -297,6 +320,14 @@ Recognize the canonical lowered patterns corresponding to the supported ResNet18
 an internal layer plan.
 
 This step performs recognition only. It does not emit Typhoon tasks directly.
+
+Its input boundary is:
+
+- post-generic model lowering, at the TIR representation that is stable enough to expose canonical
+  computation patterns for ResNet18
+
+Canonicalization into that matchable TIR form is in scope for this stage if the existing lowering
+does not already provide it.
 
 ### 3. Typhoon SRAM Planner
 
@@ -405,6 +436,27 @@ The development entry path is:
 - numerical output is correct for the fixed-shape model within `float32` tolerance of
   `rtol=1e-4, atol=1e-4`
 
+## Task Kind Layout Consumption Rules
+
+The stage-1 plan relies on explicit layout-consumption rules so the compiler knows when a reshape is
+mandatory.
+
+- `task_dma`
+  - GM side may be in ordinary logical tensor layout
+  - SRAM side may produce or consume whatever physical layout the destination region declares
+- `task_matmul`
+  - left input must consume `zZ`
+  - right input must consume `nN`
+  - output may produce `zZ` or `nN`
+- `task_vector`
+  - first-stage vector tasks may consume and produce ordinary contiguous logical layout
+  - any use on data currently held in matmul-specific fractal layout requires an explicit
+    `task_reshape` before or after unless the particular vector op is later defined to support that
+    fractal form
+- `task_reshape`
+  - may consume one physical layout and produce another physical layout
+  - includes ordinary reorder transforms and `im2col`
+
 ## Success Criteria
 
 This stage is complete only when all of the following are true:
@@ -435,3 +487,25 @@ The following are explicitly deferred to later stages:
 - multi-core scheduling
 - SRAM contention penalties
 - a generalized SRAM planner
+
+## Cost Model Update
+
+The temporary empirical cost model must be updated for this stage.
+
+For the first implementation, all supported task kinds share one common fixed launch-noise term:
+
+- `latency = common_fixed_noise + workload_term`
+
+Where:
+
+- `common_fixed_noise` is the same constant for DMA, matmul, vector, and reshape
+- `workload_term` remains task-kind specific
+
+This is required so tile-size effects are visible:
+
+- smaller tiles incur the same fixed noise more often
+- therefore total latency grows as tiles become smaller, even if total arithmetic work is
+  unchanged
+
+The goal is not production accuracy. The goal is to preserve the qualitative behavior that
+over-fragmenting a graph into many tiny tiles is slower because launch overhead accumulates.
