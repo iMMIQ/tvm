@@ -64,10 +64,10 @@ class CodeGenTyphoonHost final : public CodeGenCHost {
                   "int64_t, int64_t, int64_t, int32_t, int32_t, int32_t, void*)";
     } else if (global_symbol == "TVMTyphoonAddVectorTask") {
       signature = "int32_t TVMTyphoonAddVectorTask(int32_t, int32_t, int32_t, int32_t, int32_t, "
-                  "int32_t, int64_t, int32_t, int32_t, void*)";
+                  "int32_t, int64_t, int32_t, int32_t, void*, int32_t, void*)";
     } else if (global_symbol == "TVMTyphoonAddReshapeTask") {
       signature = "int32_t TVMTyphoonAddReshapeTask(int32_t, int32_t, int32_t, int32_t, int64_t, "
-                  "int32_t, int32_t, void*)";
+                  "int32_t, int32_t, void*, int32_t, void*)";
     } else if (global_symbol == "TVMTyphoonSubmitGraph") {
       signature = "int32_t TVMTyphoonSubmitGraph(int32_t)";
     } else if (global_symbol == "TVMTyphoonWaitGraph") {

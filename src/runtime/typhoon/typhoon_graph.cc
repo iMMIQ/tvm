@@ -20,6 +20,7 @@
 #include "typhoon_graph.h"
 
 #include <algorithm>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -31,6 +32,26 @@ namespace typhoon {
 namespace {
 
 [[noreturn]] void TyphoonError(const std::string& message) { throw std::runtime_error(message); }
+
+int64_t ComputePoolOutputExtent(int64_t input, int64_t kernel, int64_t stride, int64_t pad,
+                                const std::string& task_prefix) {
+  if (input <= 0 || kernel <= 0 || stride <= 0 || pad < 0) {
+    TyphoonError(task_prefix + " metadata values must be positive");
+  }
+  int64_t numerator = input + 2 * pad - kernel;
+  if (numerator < 0) {
+    TyphoonError(task_prefix + " metadata shape mismatch");
+  }
+  return numerator / stride + 1;
+}
+
+int64_t RequireMetadataValue(const std::vector<int64_t>& metadata, size_t index,
+                             const std::string& task_prefix) {
+  if (index >= metadata.size()) {
+    TyphoonError(task_prefix + " metadata is missing required values");
+  }
+  return metadata[index];
+}
 
 }  // namespace
 
@@ -103,14 +124,19 @@ void TyphoonGraphBuilder::AddMatmulTask(int32_t task_id, int32_t a_region_id, in
 
 void TyphoonGraphBuilder::AddVectorTask(int32_t task_id, int32_t op_code, int32_t in0_region_id,
                                         int32_t in1_region_id, int32_t out_region_id,
-                                        int64_t elem_count, int32_t dtype_code, int32_t num_deps,
+                                        int64_t elem_count, int32_t dtype_code, int32_t num_metadata,
+                                        const int64_t* metadata, int32_t num_deps,
                                         const int32_t* dep_ids) {
   TyphoonTask task;
   task.kind = TaskKind::kVector;
   task.task_id = task_id;
   task.deps = CopyDeps(num_deps, dep_ids);
-  task.reads = {in0_region_id, in1_region_id};
+  task.reads = {in0_region_id};
+  if (op_code == 0) {
+    task.reads.push_back(in1_region_id);
+  }
   task.writes = {out_region_id};
+  task.metadata = CopyMetadata(num_metadata, metadata);
   task.op_code = op_code;
   task.elem_count = elem_count;
   task.dtype_code = dtype_code;
@@ -119,7 +145,8 @@ void TyphoonGraphBuilder::AddVectorTask(int32_t task_id, int32_t op_code, int32_
 
 void TyphoonGraphBuilder::AddReshapeTask(int32_t task_id, int32_t in_region_id,
                                          int32_t out_region_id, int64_t elem_count,
-                                         int32_t transform_code, int32_t num_deps,
+                                         int32_t transform_code, int32_t num_metadata,
+                                         const int64_t* metadata, int32_t num_deps,
                                          const int32_t* dep_ids) {
   TyphoonTask task;
   task.kind = TaskKind::kReshape;
@@ -127,8 +154,9 @@ void TyphoonGraphBuilder::AddReshapeTask(int32_t task_id, int32_t in_region_id,
   task.deps = CopyDeps(num_deps, dep_ids);
   task.reads = {in_region_id};
   task.writes = {out_region_id};
+  task.metadata = CopyMetadata(num_metadata, metadata);
   task.elem_count = elem_count;
-  (void)transform_code;
+  task.transform_code = transform_code;
   AddTask(std::move(task));
 }
 
@@ -160,6 +188,22 @@ std::vector<int32_t> TyphoonGraphBuilder::CopyDeps(int32_t num_deps, const int32
     deps.push_back(dep_ids[i]);
   }
   return deps;
+}
+
+std::vector<int64_t> TyphoonGraphBuilder::CopyMetadata(int32_t num_metadata,
+                                                       const int64_t* metadata) const {
+  if (num_metadata < 0) {
+    TyphoonError("Typhoon metadata count must be non-negative");
+  }
+  if (num_metadata > 0 && metadata == nullptr) {
+    TyphoonError("Typhoon metadata array cannot be null when num_metadata > 0");
+  }
+  std::vector<int64_t> copied;
+  copied.reserve(num_metadata);
+  for (int32_t i = 0; i < num_metadata; ++i) {
+    copied.push_back(metadata[i]);
+  }
+  return copied;
 }
 
 void TyphoonGraphBuilder::AddTask(TyphoonTask task) {
@@ -319,35 +363,144 @@ void TyphoonGraphBuilder::ValidateTaskFootprints() const {
     }
 
     if (task.kind == TaskKind::kVector) {
-      int64_t bytes = task.elem_count * DTypeBytes(task.dtype_code);
-      for (int32_t region_id : task.reads) {
-        if (bytes > GetRegion(region_id).size) {
-          TyphoonError("Typhoon vector task " + std::to_string(task.task_id) +
-                       " has out-of-bounds size mismatch");
+      const auto& input = GetRegion(task.reads.at(0));
+      const auto& output = GetRegion(task.writes.at(0));
+      std::string task_prefix = "Typhoon vector task " + std::to_string(task.task_id);
+      int64_t input_bytes = 0;
+      int64_t output_bytes = 0;
+
+      switch (task.op_code) {
+        case 0: {
+          if (!task.metadata.empty()) {
+            TyphoonError(task_prefix + " add does not accept metadata");
+          }
+          int64_t bytes = task.elem_count * DTypeBytes(task.dtype_code);
+          input_bytes = bytes;
+          output_bytes = bytes;
+          if (bytes > GetRegion(task.reads.at(1)).size) {
+            TyphoonError(task_prefix + " has out-of-bounds size mismatch");
+          }
+          break;
         }
+        case 1: {
+          if (!task.metadata.empty()) {
+            TyphoonError(task_prefix + " relu does not accept metadata");
+          }
+          int64_t bytes = task.elem_count * DTypeBytes(task.dtype_code);
+          input_bytes = bytes;
+          output_bytes = bytes;
+          break;
+        }
+        case 2: {
+          if (task.dtype_code != 2) {
+            TyphoonError(task_prefix + " maxpool currently requires dtype_code=2");
+          }
+          if (task.metadata.size() != 12) {
+            TyphoonError(task_prefix + " maxpool metadata must have 12 values");
+          }
+          int64_t n = RequireMetadataValue(task.metadata, 0, task_prefix);
+          int64_t c = RequireMetadataValue(task.metadata, 1, task_prefix);
+          int64_t in_h = RequireMetadataValue(task.metadata, 2, task_prefix);
+          int64_t in_w = RequireMetadataValue(task.metadata, 3, task_prefix);
+          int64_t kernel_h = RequireMetadataValue(task.metadata, 4, task_prefix);
+          int64_t kernel_w = RequireMetadataValue(task.metadata, 5, task_prefix);
+          int64_t stride_h = RequireMetadataValue(task.metadata, 6, task_prefix);
+          int64_t stride_w = RequireMetadataValue(task.metadata, 7, task_prefix);
+          int64_t pad_h = RequireMetadataValue(task.metadata, 8, task_prefix);
+          int64_t pad_w = RequireMetadataValue(task.metadata, 9, task_prefix);
+          int64_t out_h = RequireMetadataValue(task.metadata, 10, task_prefix);
+          int64_t out_w = RequireMetadataValue(task.metadata, 11, task_prefix);
+          if (out_h != ComputePoolOutputExtent(in_h, kernel_h, stride_h, pad_h, task_prefix + " maxpool") ||
+              out_w != ComputePoolOutputExtent(in_w, kernel_w, stride_w, pad_w, task_prefix + " maxpool")) {
+            TyphoonError(task_prefix + " maxpool metadata shape mismatch");
+          }
+          if (task.elem_count != n * c * out_h * out_w) {
+            TyphoonError(task_prefix + " maxpool elem_count does not match metadata");
+          }
+          input_bytes = n * c * in_h * in_w * 4;
+          output_bytes = task.elem_count * 4;
+          break;
+        }
+        case 3: {
+          if (task.dtype_code != 2) {
+            TyphoonError(task_prefix + " global_average_pool currently requires dtype_code=2");
+          }
+          if (task.metadata.size() != 4) {
+            TyphoonError(task_prefix + " global_average_pool metadata must have 4 values");
+          }
+          int64_t n = RequireMetadataValue(task.metadata, 0, task_prefix);
+          int64_t c = RequireMetadataValue(task.metadata, 1, task_prefix);
+          int64_t in_h = RequireMetadataValue(task.metadata, 2, task_prefix);
+          int64_t in_w = RequireMetadataValue(task.metadata, 3, task_prefix);
+          if (n <= 0 || c <= 0 || in_h <= 0 || in_w <= 0) {
+            TyphoonError(task_prefix + " global_average_pool metadata values must be positive");
+          }
+          if (task.elem_count != n * c) {
+            TyphoonError(task_prefix + " global_average_pool elem_count does not match metadata");
+          }
+          input_bytes = n * c * in_h * in_w * 4;
+          output_bytes = task.elem_count * 4;
+          break;
+        }
+        default:
+          TyphoonError(task_prefix + " uses unsupported op_code " + std::to_string(task.op_code));
       }
-      for (int32_t region_id : task.writes) {
-        if (bytes > GetRegion(region_id).size) {
-          TyphoonError("Typhoon vector task " + std::to_string(task.task_id) +
-                       " has out-of-bounds size mismatch");
-        }
+
+      if (input_bytes > input.size || output_bytes > output.size) {
+        TyphoonError(task_prefix + " has out-of-bounds size mismatch");
       }
       continue;
     }
 
     if (task.kind == TaskKind::kReshape) {
-      int64_t bytes = task.elem_count;
-      for (int32_t region_id : task.reads) {
-        if (bytes > GetRegion(region_id).size) {
-          TyphoonError("Typhoon reshape task " + std::to_string(task.task_id) +
-                       " has out-of-bounds size mismatch");
+      const auto& input = GetRegion(task.reads.at(0));
+      const auto& output = GetRegion(task.writes.at(0));
+      std::string task_prefix = "Typhoon reshape task " + std::to_string(task.task_id);
+      int64_t input_bytes = 0;
+      int64_t output_bytes = 0;
+
+      switch (task.transform_code) {
+        case 0:
+          if (!task.metadata.empty()) {
+            TyphoonError(task_prefix + " copy/reorder does not accept metadata");
+          }
+          input_bytes = task.elem_count;
+          output_bytes = task.elem_count;
+          break;
+        case 1: {
+          if (task.metadata.size() != 12) {
+            TyphoonError(task_prefix + " im2col metadata must have 12 values");
+          }
+          int64_t n = RequireMetadataValue(task.metadata, 0, task_prefix);
+          int64_t c = RequireMetadataValue(task.metadata, 1, task_prefix);
+          int64_t in_h = RequireMetadataValue(task.metadata, 2, task_prefix);
+          int64_t in_w = RequireMetadataValue(task.metadata, 3, task_prefix);
+          int64_t kernel_h = RequireMetadataValue(task.metadata, 4, task_prefix);
+          int64_t kernel_w = RequireMetadataValue(task.metadata, 5, task_prefix);
+          int64_t stride_h = RequireMetadataValue(task.metadata, 6, task_prefix);
+          int64_t stride_w = RequireMetadataValue(task.metadata, 7, task_prefix);
+          int64_t pad_h = RequireMetadataValue(task.metadata, 8, task_prefix);
+          int64_t pad_w = RequireMetadataValue(task.metadata, 9, task_prefix);
+          int64_t out_h = RequireMetadataValue(task.metadata, 10, task_prefix);
+          int64_t out_w = RequireMetadataValue(task.metadata, 11, task_prefix);
+          if (out_h != ComputePoolOutputExtent(in_h, kernel_h, stride_h, pad_h, task_prefix + " im2col") ||
+              out_w != ComputePoolOutputExtent(in_w, kernel_w, stride_w, pad_w, task_prefix + " im2col")) {
+            TyphoonError(task_prefix + " im2col metadata shape mismatch");
+          }
+          input_bytes = n * c * in_h * in_w * 4;
+          output_bytes = n * out_h * out_w * c * kernel_h * kernel_w * 4;
+          if (task.elem_count != output_bytes) {
+            TyphoonError(task_prefix + " im2col elem_count does not match metadata");
+          }
+          break;
         }
+        default:
+          TyphoonError(task_prefix + " uses unsupported transform_code " +
+                       std::to_string(task.transform_code));
       }
-      for (int32_t region_id : task.writes) {
-        if (bytes > GetRegion(region_id).size) {
-          TyphoonError("Typhoon reshape task " + std::to_string(task.task_id) +
-                       " has out-of-bounds size mismatch");
-        }
+
+      if (input_bytes > input.size || output_bytes > output.size) {
+        TyphoonError(task_prefix + " has out-of-bounds size mismatch");
       }
       continue;
     }

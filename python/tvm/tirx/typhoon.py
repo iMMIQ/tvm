@@ -19,9 +19,21 @@
 import tvm
 
 
+def _normalize_metadata_and_deps(metadata_or_deps, deps):
+    if deps is None:
+        return [], [] if metadata_or_deps is None else list(metadata_or_deps)
+    return [] if metadata_or_deps is None else list(metadata_or_deps), list(deps)
+
+
 def _task_args(args, deps):
     deps = [] if deps is None else list(deps)
     return [*args, len(deps), *deps]
+
+
+def _task_args_with_metadata(args, metadata, deps):
+    metadata = [] if metadata is None else list(metadata)
+    deps = [] if deps is None else list(deps)
+    return [*args, len(metadata), *metadata, len(deps), *deps]
 
 
 def region_decl(graph_id, region_id, offset, size, alignment, preinitialized, tag, span=None):
@@ -55,8 +67,7 @@ def task_dma(
         "int32",
         "tirx.typhoon.task_dma",
         *_task_args(
-            [graph_id, task_id, direction, global_handle, global_byte_offset, sram_region_id, bytes],
-            deps,
+            [graph_id, task_id, direction, global_handle, global_byte_offset, sram_region_id, bytes], deps
         ),
         span=span,
     )
@@ -81,18 +92,7 @@ def task_matmul(
         "int32",
         "tirx.typhoon.task_matmul",
         *_task_args(
-            [
-                graph_id,
-                task_id,
-                a_region_id,
-                b_region_id,
-                c_region_id,
-                m,
-                n,
-                k,
-                dtype_code,
-                layout_code,
-            ],
+            [graph_id, task_id, a_region_id, b_region_id, c_region_id, m, n, k, dtype_code, layout_code],
             deps,
         ),
         span=span,
@@ -109,13 +109,15 @@ def task_vector(
     out_region_id,
     elem_count,
     dtype_code,
-    deps,
+    extra_window_metadata=None,
+    deps=None,
     span=None,
 ):
+    extra_window_metadata, deps = _normalize_metadata_and_deps(extra_window_metadata, deps)
     call = tvm.tirx.call_intrin(
         "int32",
         "tirx.typhoon.task_vector",
-        *_task_args(
+        *_task_args_with_metadata(
             [
                 graph_id,
                 task_id,
@@ -126,6 +128,7 @@ def task_vector(
                 elem_count,
                 dtype_code,
             ],
+            extra_window_metadata,
             deps,
         ),
         span=span,
@@ -140,14 +143,18 @@ def task_reshape(
     out_region_id,
     elem_count,
     transform_code,
-    deps,
+    extra_shape_metadata=None,
+    deps=None,
     span=None,
 ):
+    extra_shape_metadata, deps = _normalize_metadata_and_deps(extra_shape_metadata, deps)
     call = tvm.tirx.call_intrin(
         "int32",
         "tirx.typhoon.task_reshape",
-        *_task_args(
-            [graph_id, task_id, in_region_id, out_region_id, elem_count, transform_code], deps
+        *_task_args_with_metadata(
+            [graph_id, task_id, in_region_id, out_region_id, elem_count, transform_code],
+            extra_shape_metadata,
+            deps,
         ),
         span=span,
     )

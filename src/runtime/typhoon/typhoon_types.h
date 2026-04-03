@@ -58,9 +58,11 @@ struct TyphoonTask {
   std::vector<int32_t> deps;
   std::vector<int32_t> reads;
   std::vector<int32_t> writes;
+  std::vector<int64_t> metadata;
   GlobalEndpoint global_endpoint;
   int32_t direction{0};
   int32_t op_code{0};
+  int32_t transform_code{0};
   int64_t bytes{0};
   int64_t elem_count{0};
   int32_t dtype_code{0};

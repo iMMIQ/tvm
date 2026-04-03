@@ -19,6 +19,7 @@ import ctypes
 import json
 import os
 
+import numpy as np
 import pytest
 import tvm
 
@@ -61,6 +62,8 @@ def _runtime():
         ctypes.c_int64,
         ctypes.c_int32,
         ctypes.c_int32,
+        ctypes.POINTER(ctypes.c_int64),
+        ctypes.c_int32,
         ctypes.POINTER(ctypes.c_int32),
     ]
     lib.TVMTyphoonAddVectorTask.restype = ctypes.c_int
@@ -71,6 +74,8 @@ def _runtime():
         ctypes.c_int32,
         ctypes.c_int64,
         ctypes.c_int32,
+        ctypes.c_int32,
+        ctypes.POINTER(ctypes.c_int64),
         ctypes.c_int32,
         ctypes.POINTER(ctypes.c_int32),
     ]
@@ -97,9 +102,39 @@ def _dep_buffer(dep_ids):
     return len(dep_ids), arr
 
 
+def _metadata_buffer(metadata):
+    metadata = list(metadata)
+    if not metadata:
+        return 0, None
+    arr = (ctypes.c_int64 * len(metadata))(*metadata)
+    return len(metadata), arr
+
+
 def _check_ok(last_error, code):
     if code != 0:
         raise RuntimeError(last_error())
+
+
+def _add_vector_task(lib, last_error, *base_args, metadata=(), deps=()):
+    num_metadata, metadata_ptr = _metadata_buffer(metadata)
+    num_deps, dep_ids = _dep_buffer(deps)
+    _check_ok(
+        last_error,
+        lib.TVMTyphoonAddVectorTask(
+            *base_args, num_metadata, metadata_ptr, num_deps, dep_ids
+        ),
+    )
+
+
+def _add_reshape_task(lib, last_error, *base_args, metadata=(), deps=()):
+    num_metadata, metadata_ptr = _metadata_buffer(metadata)
+    num_deps, dep_ids = _dep_buffer(deps)
+    _check_ok(
+        last_error,
+        lib.TVMTyphoonAddReshapeTask(
+            *base_args, num_metadata, metadata_ptr, num_deps, dep_ids
+        ),
+    )
 
 
 def _run_graph(**flags):
@@ -133,30 +168,34 @@ def _run_graph(**flags):
     )
 
     if flags.get("duplicate_task_id", False):
-        num_deps, dep_ids = _dep_buffer([])
-        _check_ok(last_error, lib.TVMTyphoonAddReshapeTask(graph_id, 1, 0, 1, 64, 0, num_deps, dep_ids))
-        _check_ok(last_error, lib.TVMTyphoonAddReshapeTask(graph_id, 1, 0, 1, 64, 0, num_deps, dep_ids))
+        _add_reshape_task(lib, last_error, graph_id, 1, 0, 1, 64, 0)
+        _add_reshape_task(lib, last_error, graph_id, 1, 0, 1, 64, 0)
     elif flags.get("unknown_dep", False):
-        num_deps, dep_ids = _dep_buffer([99])
-        _check_ok(last_error, lib.TVMTyphoonAddReshapeTask(graph_id, 1, 0, 1, 64, 0, num_deps, dep_ids))
+        _add_reshape_task(lib, last_error, graph_id, 1, 0, 1, 64, 0, deps=[99])
     elif flags.get("compute_reads_unknown_region", False):
-        num_deps, dep_ids = _dep_buffer([])
-        _check_ok(last_error, lib.TVMTyphoonAddVectorTask(graph_id, 1, 0, 99, 99, 1, 64, 2, num_deps, dep_ids))
+        _add_vector_task(lib, last_error, graph_id, 1, 0, 99, 99, 1, 64, 2)
     elif flags.get("dma_bytes_too_large", False):
         num_deps, dep_ids = _dep_buffer([])
-        _check_ok(last_error, lib.TVMTyphoonAddDMATask(graph_id, 1, 0, ctypes.c_void_p(1), 0, 0, 512, num_deps, dep_ids))
+        _check_ok(
+            last_error,
+            lib.TVMTyphoonAddDMATask(
+                graph_id, 1, 0, ctypes.c_void_p(1), 0, 0, 512, num_deps, dep_ids
+            ),
+        )
     elif flags.get("vector_output_too_large", False):
-        num_deps, dep_ids = _dep_buffer([])
-        _check_ok(last_error, lib.TVMTyphoonAddVectorTask(graph_id, 1, 0, 0, 0, 1, 128, 2, num_deps, dep_ids))
+        _add_vector_task(lib, last_error, graph_id, 1, 0, 0, 0, 1, 128, 2)
     else:
         if flags.get("preinitialized_input", False):
-            num_deps, dep_ids = _dep_buffer([])
-            _check_ok(last_error, lib.TVMTyphoonAddReshapeTask(graph_id, 1, 0, 1, 64, 0, num_deps, dep_ids))
+            _add_reshape_task(lib, last_error, graph_id, 1, 0, 1, 64, 0)
         else:
             num_deps, dep_ids = _dep_buffer([])
-            _check_ok(last_error, lib.TVMTyphoonAddDMATask(graph_id, 1, 0, ctypes.c_void_p(1), 0, 0, 256, num_deps, dep_ids))
-            num_deps, dep_ids = _dep_buffer([1])
-            _check_ok(last_error, lib.TVMTyphoonAddReshapeTask(graph_id, 2, 0, 1, 64, 0, num_deps, dep_ids))
+            _check_ok(
+                last_error,
+                lib.TVMTyphoonAddDMATask(
+                    graph_id, 1, 0, ctypes.c_void_p(1), 0, 0, 256, num_deps, dep_ids
+                ),
+            )
+            _add_reshape_task(lib, last_error, graph_id, 2, 0, 1, 64, 0, deps=[1])
 
     _check_ok(last_error, lib.TVMTyphoonGraphBegin(graph_id))
     _check_ok(last_error, lib.TVMTyphoonSubmitGraph(graph_id))
@@ -206,9 +245,8 @@ def _run_and_get_trace():
     _check_ok(last_error, lib.TVMTyphoonDeclareRegion(graph_id, 1, 256, 256, 64, 0, b"left"))
     _check_ok(last_error, lib.TVMTyphoonDeclareRegion(graph_id, 2, 512, 256, 64, 0, b"right"))
 
-    num_deps, dep_ids = _dep_buffer([])
-    _check_ok(last_error, lib.TVMTyphoonAddReshapeTask(graph_id, 2, 0, 2, 64, 0, num_deps, dep_ids))
-    _check_ok(last_error, lib.TVMTyphoonAddReshapeTask(graph_id, 1, 0, 1, 64, 0, num_deps, dep_ids))
+    _add_reshape_task(lib, last_error, graph_id, 2, 0, 2, 64, 0)
+    _add_reshape_task(lib, last_error, graph_id, 1, 0, 1, 64, 0)
     _check_ok(last_error, lib.TVMTyphoonGraphBegin(graph_id))
     _check_ok(last_error, lib.TVMTyphoonSubmitGraph(graph_id))
     _check_ok(last_error, lib.TVMTyphoonWaitGraph(graph_id))
@@ -233,3 +271,128 @@ def test_typhoon_trace_has_required_fields():
         "sram_bytes_read",
         "sram_bytes_written",
     } <= set(trace[0])
+
+
+def _run_dataflow_graph(task_id, input_array, output_shape, emit_task):
+    lib, reset, last_error, _ = _runtime()
+    reset()
+    graph_id = 80 + task_id
+    input_array = np.array(input_array, dtype="float32", copy=True)
+    output_array = np.zeros(output_shape, dtype="float32")
+
+    _check_ok(last_error, lib.TVMTyphoonDeclareRegion(graph_id, 0, 0, input_array.nbytes, 64, 0, b"input"))
+    _check_ok(
+        last_error,
+        lib.TVMTyphoonDeclareRegion(graph_id, 1, 256, output_array.nbytes, 64, 0, b"output"),
+    )
+
+    num_deps, dep_ids = _dep_buffer([])
+    _check_ok(
+        last_error,
+        lib.TVMTyphoonAddDMATask(
+            graph_id,
+            1,
+            0,
+            ctypes.c_void_p(input_array.ctypes.data),
+            0,
+            0,
+            input_array.nbytes,
+            num_deps,
+            dep_ids,
+        ),
+    )
+    emit_task(lib, last_error, graph_id)
+    num_deps, dep_ids = _dep_buffer([2])
+    _check_ok(
+        last_error,
+        lib.TVMTyphoonAddDMATask(
+            graph_id,
+            3,
+            1,
+            ctypes.c_void_p(output_array.ctypes.data),
+            0,
+            1,
+            output_array.nbytes,
+            num_deps,
+            dep_ids,
+        ),
+    )
+    _check_ok(last_error, lib.TVMTyphoonGraphBegin(graph_id))
+    _check_ok(last_error, lib.TVMTyphoonSubmitGraph(graph_id))
+    _check_ok(last_error, lib.TVMTyphoonWaitGraph(graph_id))
+    return output_array
+
+
+def test_runtime_typhoon_executes_reshape_im2col():
+    output = _run_dataflow_graph(
+        1,
+        np.arange(1, 10, dtype="float32").reshape(1, 1, 3, 3),
+        (16,),
+        lambda lib, last_error, graph_id: _add_reshape_task(
+            lib,
+            last_error,
+            graph_id,
+            2,
+            0,
+            1,
+            64,
+            1,
+            metadata=[1, 1, 3, 3, 2, 2, 1, 1, 0, 0, 2, 2],
+            deps=[1],
+        ),
+    )
+    np.testing.assert_allclose(
+        output,
+        np.array(
+            [1.0, 2.0, 4.0, 5.0, 2.0, 3.0, 5.0, 6.0, 4.0, 5.0, 7.0, 8.0, 5.0, 6.0, 8.0, 9.0],
+            dtype="float32",
+        ),
+    )
+
+
+def test_runtime_typhoon_executes_vector_maxpool():
+    output = _run_dataflow_graph(
+        2,
+        np.arange(1, 17, dtype="float32").reshape(1, 1, 4, 4),
+        (1, 1, 2, 2),
+        lambda lib, last_error, graph_id: _add_vector_task(
+            lib,
+            last_error,
+            graph_id,
+            2,
+            2,
+            0,
+            0,
+            1,
+            4,
+            2,
+            metadata=[1, 1, 4, 4, 3, 3, 2, 2, 1, 1, 2, 2],
+            deps=[1],
+        ),
+    )
+    np.testing.assert_allclose(output, np.array([[[[6.0, 8.0], [14.0, 16.0]]]], dtype="float32"))
+
+
+def test_runtime_typhoon_executes_vector_global_average_pool():
+    output = _run_dataflow_graph(
+        3,
+        np.array(
+            [[[[1.0, 2.0], [3.0, 4.0]], [[10.0, 14.0], [18.0, 22.0]]]], dtype="float32"
+        ),
+        (1, 2, 1, 1),
+        lambda lib, last_error, graph_id: _add_vector_task(
+            lib,
+            last_error,
+            graph_id,
+            2,
+            3,
+            0,
+            0,
+            1,
+            2,
+            2,
+            metadata=[1, 2, 2, 2],
+            deps=[1],
+        ),
+    )
+    np.testing.assert_allclose(output, np.array([[[[2.5]], [[16.0]]]], dtype="float32"))

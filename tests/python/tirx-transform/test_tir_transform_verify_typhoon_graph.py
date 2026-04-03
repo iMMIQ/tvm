@@ -184,6 +184,88 @@ def test_verify_typhoon_graph_rejects_unordered_writers_to_same_region():
         _verify(mod)
 
 
+def test_verify_typhoon_graph_accepts_im2col_reshape_payload():
+    mod = _make_mod(
+        tvm.tirx.typhoon.region_decl(GRAPH_ID, 0, 0, 64, 64, 1, "input"),
+        tvm.tirx.typhoon.region_decl(GRAPH_ID, 1, 64, 64, 64, 0, "output"),
+        tvm.tirx.typhoon.task_reshape(
+            GRAPH_ID,
+            1,
+            0,
+            1,
+            64,
+            1,
+            extra_shape_metadata=[1, 1, 3, 3, 2, 2, 1, 1, 0, 0, 2, 2],
+            deps=[],
+        ),
+        tvm.tirx.typhoon.submit_graph(GRAPH_ID),
+    )
+    _verify(mod)
+
+
+def test_verify_typhoon_graph_rejects_im2col_reshape_payload_shape_mismatch():
+    mod = _make_mod(
+        tvm.tirx.typhoon.region_decl(GRAPH_ID, 0, 0, 64, 64, 1, "input"),
+        tvm.tirx.typhoon.region_decl(GRAPH_ID, 1, 64, 64, 64, 0, "output"),
+        tvm.tirx.typhoon.task_reshape(
+            GRAPH_ID,
+            1,
+            0,
+            1,
+            64,
+            1,
+            extra_shape_metadata=[1, 1, 3, 3, 2, 2, 1, 1, 0, 0, 3, 2],
+            deps=[],
+        ),
+        tvm.tirx.typhoon.submit_graph(GRAPH_ID),
+    )
+    with pytest.raises(ValueError, match="im2col|shape|metadata"):
+        _verify(mod)
+
+
+def test_verify_typhoon_graph_rejects_maxpool_payload_shape_mismatch():
+    mod = _make_mod(
+        tvm.tirx.typhoon.region_decl(GRAPH_ID, 0, 0, 256, 64, 1, "input"),
+        tvm.tirx.typhoon.region_decl(GRAPH_ID, 1, 256, 256, 64, 0, "output"),
+        tvm.tirx.typhoon.task_vector(
+            GRAPH_ID,
+            1,
+            2,
+            0,
+            0,
+            1,
+            5,
+            2,
+            extra_window_metadata=[1, 1, 4, 4, 3, 3, 2, 2, 1, 1, 2, 2],
+            deps=[],
+        ),
+        tvm.tirx.typhoon.submit_graph(GRAPH_ID),
+    )
+    with pytest.raises(ValueError, match="maxpool|elem_count|metadata"):
+        _verify(mod)
+
+
+def test_verify_typhoon_graph_accepts_global_average_pool_payload():
+    mod = _make_mod(
+        tvm.tirx.typhoon.region_decl(GRAPH_ID, 0, 0, 64, 64, 1, "input"),
+        tvm.tirx.typhoon.region_decl(GRAPH_ID, 1, 64, 64, 64, 0, "output"),
+        tvm.tirx.typhoon.task_vector(
+            GRAPH_ID,
+            1,
+            3,
+            0,
+            -1,
+            1,
+            2,
+            2,
+            extra_window_metadata=[1, 2, 2, 2],
+            deps=[],
+        ),
+        tvm.tirx.typhoon.submit_graph(GRAPH_ID),
+    )
+    _verify(mod)
+
+
 def test_finalize_host_passes_runs_verify_typhoon_graph_before_lowering():
     mod = _make_mod(
         tvm.tirx.typhoon.region_decl(GRAPH_ID, 0, 0, 256, 64, 0, "input"),

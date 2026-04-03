@@ -26,6 +26,7 @@
 #include <tvm/ffi/reflection/registry.h>
 
 #include <mutex>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -52,6 +53,14 @@ T* SramPtr(std::vector<uint8_t>* sram, const TyphoonRegion& region) {
   return reinterpret_cast<T*>(sram->data() + region.offset);
 }
 
+int64_t MetadataAt(const TyphoonTask& task, size_t index, const char* task_kind) {
+  if (index >= task.metadata.size()) {
+    throw std::runtime_error(std::string("Typhoon ") + task_kind + " task " +
+                             std::to_string(task.task_id) + " metadata is incomplete");
+  }
+  return task.metadata[index];
+}
+
 void ExecuteTask(const TyphoonGraphBuilder& graph, const TyphoonTask& task, std::vector<uint8_t>* sram) {
   switch (task.kind) {
     case TaskKind::kDMA: {
@@ -69,7 +78,53 @@ void ExecuteTask(const TyphoonGraphBuilder& graph, const TyphoonTask& task, std:
     case TaskKind::kReshape: {
       const auto& input = FindRegion(graph, task.reads.at(0));
       const auto& output = FindRegion(graph, task.writes.at(0));
-      std::memcpy(SramPtr<>(sram, output), SramPtr<>(sram, input), static_cast<size_t>(task.elem_count));
+      if (task.transform_code == 0) {
+        std::memcpy(SramPtr<>(sram, output), SramPtr<>(sram, input), static_cast<size_t>(task.elem_count));
+        return;
+      }
+      if (task.transform_code != 1) {
+        throw std::runtime_error("Typhoon reshape execution uses unsupported transform_code " +
+                                 std::to_string(task.transform_code));
+      }
+
+      auto* input_ptr = SramPtr<float>(sram, input);
+      auto* output_ptr = SramPtr<float>(sram, output);
+      int64_t n = MetadataAt(task, 0, "reshape");
+      int64_t c = MetadataAt(task, 1, "reshape");
+      int64_t in_h = MetadataAt(task, 2, "reshape");
+      int64_t in_w = MetadataAt(task, 3, "reshape");
+      int64_t kernel_h = MetadataAt(task, 4, "reshape");
+      int64_t kernel_w = MetadataAt(task, 5, "reshape");
+      int64_t stride_h = MetadataAt(task, 6, "reshape");
+      int64_t stride_w = MetadataAt(task, 7, "reshape");
+      int64_t pad_h = MetadataAt(task, 8, "reshape");
+      int64_t pad_w = MetadataAt(task, 9, "reshape");
+      int64_t out_h = MetadataAt(task, 10, "reshape");
+      int64_t out_w = MetadataAt(task, 11, "reshape");
+      int64_t patch_size = c * kernel_h * kernel_w;
+
+      for (int64_t ni = 0; ni < n; ++ni) {
+        for (int64_t oh = 0; oh < out_h; ++oh) {
+          for (int64_t ow = 0; ow < out_w; ++ow) {
+            int64_t row = ((ni * out_h) + oh) * out_w + ow;
+            for (int64_t ci = 0; ci < c; ++ci) {
+              for (int64_t kh = 0; kh < kernel_h; ++kh) {
+                for (int64_t kw = 0; kw < kernel_w; ++kw) {
+                  int64_t ih = oh * stride_h + kh - pad_h;
+                  int64_t iw = ow * stride_w + kw - pad_w;
+                  int64_t col = ((ci * kernel_h) + kh) * kernel_w + kw;
+                  float value = 0.0f;
+                  if (ih >= 0 && ih < in_h && iw >= 0 && iw < in_w) {
+                    int64_t input_index = ((ni * c + ci) * in_h + ih) * in_w + iw;
+                    value = input_ptr[input_index];
+                  }
+                  output_ptr[row * patch_size + col] = value;
+                }
+              }
+            }
+          }
+        }
+      }
       return;
     }
     case TaskKind::kVector: {
@@ -77,19 +132,86 @@ void ExecuteTask(const TyphoonGraphBuilder& graph, const TyphoonTask& task, std:
         throw std::runtime_error("Typhoon vector execution currently supports dtype_code=2 only");
       }
       const auto& in0 = FindRegion(graph, task.reads.at(0));
-      const auto& in1 = FindRegion(graph, task.reads.at(1));
       const auto& out = FindRegion(graph, task.writes.at(0));
       auto* in0_ptr = SramPtr<float>(sram, in0);
-      auto* in1_ptr = SramPtr<float>(sram, in1);
       auto* out_ptr = SramPtr<float>(sram, out);
-      for (int64_t i = 0; i < task.elem_count; ++i) {
-        if (task.op_code == 0) {
+
+      if (task.op_code == 0) {
+        const auto& in1 = FindRegion(graph, task.reads.at(1));
+        auto* in1_ptr = SramPtr<float>(sram, in1);
+        for (int64_t i = 0; i < task.elem_count; ++i) {
           out_ptr[i] = in0_ptr[i] + in1_ptr[i];
-        } else {
-          out_ptr[i] = in0_ptr[i];
         }
+        return;
       }
-      return;
+
+      if (task.op_code == 1) {
+        for (int64_t i = 0; i < task.elem_count; ++i) {
+          out_ptr[i] = std::max(in0_ptr[i], 0.0f);
+        }
+        return;
+      }
+
+      if (task.op_code == 2) {
+        int64_t n = MetadataAt(task, 0, "vector");
+        int64_t c = MetadataAt(task, 1, "vector");
+        int64_t in_h = MetadataAt(task, 2, "vector");
+        int64_t in_w = MetadataAt(task, 3, "vector");
+        int64_t kernel_h = MetadataAt(task, 4, "vector");
+        int64_t kernel_w = MetadataAt(task, 5, "vector");
+        int64_t stride_h = MetadataAt(task, 6, "vector");
+        int64_t stride_w = MetadataAt(task, 7, "vector");
+        int64_t pad_h = MetadataAt(task, 8, "vector");
+        int64_t pad_w = MetadataAt(task, 9, "vector");
+        int64_t out_h = MetadataAt(task, 10, "vector");
+        int64_t out_w = MetadataAt(task, 11, "vector");
+        for (int64_t ni = 0; ni < n; ++ni) {
+          for (int64_t ci = 0; ci < c; ++ci) {
+            for (int64_t oh = 0; oh < out_h; ++oh) {
+              for (int64_t ow = 0; ow < out_w; ++ow) {
+                float best = -std::numeric_limits<float>::infinity();
+                for (int64_t kh = 0; kh < kernel_h; ++kh) {
+                  for (int64_t kw = 0; kw < kernel_w; ++kw) {
+                    int64_t ih = oh * stride_h + kh - pad_h;
+                    int64_t iw = ow * stride_w + kw - pad_w;
+                    if (ih >= 0 && ih < in_h && iw >= 0 && iw < in_w) {
+                      int64_t input_index = ((ni * c + ci) * in_h + ih) * in_w + iw;
+                      best = std::max(best, in0_ptr[input_index]);
+                    }
+                  }
+                }
+                int64_t output_index = ((ni * c + ci) * out_h + oh) * out_w + ow;
+                out_ptr[output_index] = best;
+              }
+            }
+          }
+        }
+        return;
+      }
+
+      if (task.op_code == 3) {
+        int64_t n = MetadataAt(task, 0, "vector");
+        int64_t c = MetadataAt(task, 1, "vector");
+        int64_t in_h = MetadataAt(task, 2, "vector");
+        int64_t in_w = MetadataAt(task, 3, "vector");
+        float denom = static_cast<float>(in_h * in_w);
+        for (int64_t ni = 0; ni < n; ++ni) {
+          for (int64_t ci = 0; ci < c; ++ci) {
+            float sum = 0.0f;
+            for (int64_t ih = 0; ih < in_h; ++ih) {
+              for (int64_t iw = 0; iw < in_w; ++iw) {
+                int64_t input_index = ((ni * c + ci) * in_h + ih) * in_w + iw;
+                sum += in0_ptr[input_index];
+              }
+            }
+            out_ptr[ni * c + ci] = sum / denom;
+          }
+        }
+        return;
+      }
+
+      throw std::runtime_error("Typhoon vector execution uses unsupported op_code " +
+                               std::to_string(task.op_code));
     }
     case TaskKind::kMatmul: {
       if (task.dtype_code != 2) {
@@ -216,21 +338,23 @@ class TyphoonRuntimeState {
 
   int AddVectorTask(int32_t graph_id, int32_t task_id, int32_t op_code, int32_t in0_region_id,
                     int32_t in1_region_id, int32_t out_region_id, int64_t elem_count,
-                    int32_t dtype_code, int32_t num_deps, const int32_t* dep_ids) {
+                    int32_t dtype_code, int32_t num_metadata, const int64_t* metadata,
+                    int32_t num_deps, const int32_t* dep_ids) {
     return Call([&]() {
       GetOrCreateGraph(graph_id)
           .AddVectorTask(task_id, op_code, in0_region_id, in1_region_id, out_region_id,
-                         elem_count, dtype_code, num_deps, dep_ids);
+                         elem_count, dtype_code, num_metadata, metadata, num_deps, dep_ids);
     });
   }
 
   int AddReshapeTask(int32_t graph_id, int32_t task_id, int32_t in_region_id,
                      int32_t out_region_id, int64_t elem_count, int32_t transform_code,
-                     int32_t num_deps, const int32_t* dep_ids) {
+                     int32_t num_metadata, const int64_t* metadata, int32_t num_deps,
+                     const int32_t* dep_ids) {
     return Call([&]() {
       GetOrCreateGraph(graph_id)
           .AddReshapeTask(task_id, in_region_id, out_region_id, elem_count, transform_code,
-                          num_deps, dep_ids);
+                          num_metadata, metadata, num_deps, dep_ids);
     });
   }
 
@@ -319,20 +443,22 @@ extern "C" int TVMTyphoonAddMatmulTask(int32_t graph_id, int32_t task_id, int32_
 extern "C" int TVMTyphoonAddVectorTask(int32_t graph_id, int32_t task_id, int32_t op_code,
                                        int32_t in0_region_id, int32_t in1_region_id,
                                        int32_t out_region_id, int64_t elem_count,
-                                       int32_t dtype_code, int32_t num_deps,
+                                       int32_t dtype_code, int32_t num_metadata,
+                                       const int64_t* metadata, int32_t num_deps,
                                        const int32_t* dep_ids) {
   return tvm::runtime::typhoon::TyphoonRuntimeState::Global().AddVectorTask(
       graph_id, task_id, op_code, in0_region_id, in1_region_id, out_region_id, elem_count,
-      dtype_code, num_deps, dep_ids);
+      dtype_code, num_metadata, metadata, num_deps, dep_ids);
 }
 
 extern "C" int TVMTyphoonAddReshapeTask(int32_t graph_id, int32_t task_id, int32_t in_region_id,
                                         int32_t out_region_id, int64_t elem_count,
-                                        int32_t transform_code, int32_t num_deps,
+                                        int32_t transform_code, int32_t num_metadata,
+                                        const int64_t* metadata, int32_t num_deps,
                                         const int32_t* dep_ids) {
   return tvm::runtime::typhoon::TyphoonRuntimeState::Global().AddReshapeTask(
-      graph_id, task_id, in_region_id, out_region_id, elem_count, transform_code, num_deps,
-      dep_ids);
+      graph_id, task_id, in_region_id, out_region_id, elem_count, transform_code, num_metadata,
+      metadata, num_deps, dep_ids);
 }
 
 extern "C" int TVMTyphoonSubmitGraph(int32_t graph_id) {

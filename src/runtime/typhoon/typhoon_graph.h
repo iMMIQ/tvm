@@ -48,10 +48,11 @@ class TyphoonGraphBuilder {
                      int32_t layout_code, int32_t num_deps, const int32_t* dep_ids);
   void AddVectorTask(int32_t task_id, int32_t op_code, int32_t in0_region_id,
                      int32_t in1_region_id, int32_t out_region_id, int64_t elem_count,
-                     int32_t dtype_code, int32_t num_deps, const int32_t* dep_ids);
+                     int32_t dtype_code, int32_t num_metadata, const int64_t* metadata,
+                     int32_t num_deps, const int32_t* dep_ids);
   void AddReshapeTask(int32_t task_id, int32_t in_region_id, int32_t out_region_id,
-                      int64_t elem_count, int32_t transform_code, int32_t num_deps,
-                      const int32_t* dep_ids);
+                      int64_t elem_count, int32_t transform_code, int32_t num_metadata,
+                      const int64_t* metadata, int32_t num_deps, const int32_t* dep_ids);
   void Submit();
   void Wait() const;
   int32_t graph_id() const { return graph_id_; }
@@ -62,6 +63,7 @@ class TyphoonGraphBuilder {
 
  private:
   std::vector<int32_t> CopyDeps(int32_t num_deps, const int32_t* dep_ids) const;
+  std::vector<int64_t> CopyMetadata(int32_t num_metadata, const int64_t* metadata) const;
   void AddTask(TyphoonTask task);
   void CheckRegionBounds(const TyphoonRegion& region) const;
   void CheckRegionOverlap(const TyphoonRegion& region) const;

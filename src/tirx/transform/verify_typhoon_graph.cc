@@ -58,6 +58,11 @@ struct TyphoonTaskInfo {
   std::vector<int64_t> deps;
   std::vector<int64_t> reads;
   std::vector<int64_t> writes;
+  int64_t elem_count{0};
+  int64_t dtype_code{0};
+  int64_t op_code{0};
+  int64_t transform_code{0};
+  std::vector<int64_t> metadata;
 };
 
 class TyphoonGraphVerifier : public StmtExprVisitor {
@@ -70,6 +75,7 @@ class TyphoonGraphVerifier : public StmtExprVisitor {
     VerifyDependencies();
     VerifyInitialization();
     VerifyWriteHazards();
+    VerifyTaskPayloads();
   }
 
  private:
@@ -93,9 +99,9 @@ class TyphoonGraphVerifier : public StmtExprVisitor {
     } else if (call->op.same_as(task_matmul_op_)) {
       CollectTask(call, "matmul", /*num_deps_index=*/10, {2, 3}, {4});
     } else if (call->op.same_as(task_vector_op_)) {
-      CollectTask(call, "vector", /*num_deps_index=*/8, {3, 4}, {5});
+      CollectVectorTask(call);
     } else if (call->op.same_as(task_reshape_op_)) {
-      CollectTask(call, "reshape", /*num_deps_index=*/6, {2}, {3});
+      CollectReshapeTask(call);
     }
 
     StmtExprVisitor::VisitStmt_(op);
@@ -106,6 +112,43 @@ class TyphoonGraphVerifier : public StmtExprVisitor {
       return imm->value;
     }
     TVM_FFI_THROW(ValueError) << "Typhoon graph requires constant integer " << field;
+  }
+
+  struct ParsedMetadataAndDeps {
+    std::vector<int64_t> metadata;
+    std::vector<int64_t> deps;
+  };
+
+  ParsedMetadataAndDeps ParseMetadataAndDeps(const CallNode* call, int num_metadata_index,
+                                             const std::string& task_kind) const {
+    TVM_FFI_CHECK_LT(num_metadata_index, static_cast<int>(call->args.size()), ValueError)
+        << "Typhoon " << task_kind << " task is missing metadata count";
+    int64_t num_metadata = ExpectInt(call->args[num_metadata_index], "num_metadata");
+    TVM_FFI_CHECK_GE(num_metadata, 0, ValueError)
+        << "Typhoon " << task_kind << " task metadata count must be non-negative";
+    int64_t num_deps_index = num_metadata_index + 1 + num_metadata;
+    TVM_FFI_CHECK_LT(num_deps_index, static_cast<int64_t>(call->args.size()), ValueError)
+        << "Typhoon " << task_kind << " task is missing dependency metadata";
+
+    ParsedMetadataAndDeps parsed;
+    parsed.metadata.reserve(num_metadata);
+    for (int64_t i = 0; i < num_metadata; ++i) {
+      parsed.metadata.push_back(
+          ExpectInt(call->args[num_metadata_index + 1 + i], "metadata_value"));
+    }
+
+    int64_t num_deps = ExpectInt(call->args[num_deps_index], "num_deps");
+    TVM_FFI_CHECK_GE(num_deps, 0, ValueError)
+        << "Typhoon " << task_kind << " task dependency count must be non-negative";
+    TVM_FFI_CHECK_EQ(static_cast<int64_t>(call->args.size()), num_deps_index + 1 + num_deps,
+                     ValueError)
+        << "Typhoon " << task_kind << " task dependency list length mismatch";
+
+    parsed.deps.reserve(num_deps);
+    for (int64_t i = 0; i < num_deps; ++i) {
+      parsed.deps.push_back(ExpectInt(call->args[num_deps_index + 1 + i], "dep_task_id"));
+    }
+    return parsed;
   }
 
   std::vector<int64_t> ParseDeps(const CallNode* call, int num_deps_index,
@@ -202,6 +245,52 @@ class TyphoonGraphVerifier : public StmtExprVisitor {
     } else {
       TVM_FFI_THROW(ValueError) << "Typhoon DMA direction must be 0 or 1";
     }
+
+    AddTask(std::move(task));
+  }
+
+  void CollectVectorTask(const CallNode* call) {
+    TVM_FFI_CHECK_GT(static_cast<int>(call->args.size()), 8, ValueError)
+        << "tirx.typhoon.task_vector is missing required operands";
+
+    TyphoonTaskInfo task;
+    RequireGraphId(call->args[0], "vector");
+    task.task_id = ExpectInt(call->args[1], "task_id");
+    task.kind = "vector";
+    task.op_code = ExpectInt(call->args[2], "op_code");
+    task.elem_count = ExpectInt(call->args[6], "elem_count");
+    task.dtype_code = ExpectInt(call->args[7], "dtype_code");
+    TVM_FFI_CHECK_GE(task.task_id, 0, ValueError) << "Typhoon task_id must be non-negative";
+
+    auto parsed = ParseMetadataAndDeps(call, /*num_metadata_index=*/8, task.kind);
+    task.metadata = std::move(parsed.metadata);
+    task.deps = std::move(parsed.deps);
+    task.reads = {ExpectInt(call->args[3], "region_id")};
+    if (task.op_code == 0) {
+      task.reads.push_back(ExpectInt(call->args[4], "region_id"));
+    }
+    task.writes = {ExpectInt(call->args[5], "region_id")};
+
+    AddTask(std::move(task));
+  }
+
+  void CollectReshapeTask(const CallNode* call) {
+    TVM_FFI_CHECK_GT(static_cast<int>(call->args.size()), 6, ValueError)
+        << "tirx.typhoon.task_reshape is missing required operands";
+
+    TyphoonTaskInfo task;
+    RequireGraphId(call->args[0], "reshape");
+    task.task_id = ExpectInt(call->args[1], "task_id");
+    task.kind = "reshape";
+    task.elem_count = ExpectInt(call->args[4], "elem_count");
+    task.transform_code = ExpectInt(call->args[5], "transform_code");
+    TVM_FFI_CHECK_GE(task.task_id, 0, ValueError) << "Typhoon task_id must be non-negative";
+
+    auto parsed = ParseMetadataAndDeps(call, /*num_metadata_index=*/6, task.kind);
+    task.metadata = std::move(parsed.metadata);
+    task.deps = std::move(parsed.deps);
+    task.reads = {ExpectInt(call->args[2], "region_id")};
+    task.writes = {ExpectInt(call->args[3], "region_id")};
 
     AddTask(std::move(task));
   }
@@ -373,6 +462,185 @@ class TyphoonGraphVerifier : public StmtExprVisitor {
     }
   }
 
+  void VerifyTaskPayloads() const {
+    auto expect_positive = [](int64_t value, const char* field, const TyphoonTaskInfo& task) {
+      TVM_FFI_CHECK_GT(value, 0, ValueError)
+          << "Typhoon " << task.kind << " task " << task.task_id << " requires positive "
+          << field;
+    };
+    auto expect_non_negative = [](int64_t value, const char* field, const TyphoonTaskInfo& task) {
+      TVM_FFI_CHECK_GE(value, 0, ValueError)
+          << "Typhoon " << task.kind << " task " << task.task_id << " requires non-negative "
+          << field;
+    };
+
+    for (const auto& task : tasks_) {
+      if (task.kind == "vector") {
+        switch (task.op_code) {
+          case 0:
+          case 1: {
+            TVM_FFI_CHECK(task.metadata.empty(), ValueError)
+                << "Typhoon vector task " << task.task_id
+                << " does not accept metadata for add/relu";
+            int64_t bytes = task.elem_count * DTypeBytes(task.dtype_code);
+            TVM_FFI_CHECK_LE(bytes, regions_.at(task.reads[0]).size, ValueError)
+                << "Typhoon vector task " << task.task_id << " has out-of-bounds size mismatch";
+            if (task.op_code == 0) {
+              TVM_FFI_CHECK_LE(bytes, regions_.at(task.reads[1]).size, ValueError)
+                  << "Typhoon vector task " << task.task_id
+                  << " has out-of-bounds size mismatch";
+            }
+            TVM_FFI_CHECK_LE(bytes, regions_.at(task.writes[0]).size, ValueError)
+                << "Typhoon vector task " << task.task_id << " has out-of-bounds size mismatch";
+            break;
+          }
+          case 2: {
+            TVM_FFI_CHECK_EQ(task.metadata.size(), 12U, ValueError)
+                << "Typhoon vector maxpool task " << task.task_id
+                << " expects 12 metadata values";
+            TVM_FFI_CHECK_EQ(task.dtype_code, 2, ValueError)
+                << "Typhoon vector maxpool task " << task.task_id
+                << " currently requires dtype_code=2";
+            int64_t n = task.metadata[0];
+            int64_t c = task.metadata[1];
+            int64_t in_h = task.metadata[2];
+            int64_t in_w = task.metadata[3];
+            int64_t kernel_h = task.metadata[4];
+            int64_t kernel_w = task.metadata[5];
+            int64_t stride_h = task.metadata[6];
+            int64_t stride_w = task.metadata[7];
+            int64_t pad_h = task.metadata[8];
+            int64_t pad_w = task.metadata[9];
+            int64_t out_h = task.metadata[10];
+            int64_t out_w = task.metadata[11];
+            expect_positive(n, "n", task);
+            expect_positive(c, "c", task);
+            expect_positive(in_h, "in_h", task);
+            expect_positive(in_w, "in_w", task);
+            expect_positive(kernel_h, "kernel_h", task);
+            expect_positive(kernel_w, "kernel_w", task);
+            expect_positive(stride_h, "stride_h", task);
+            expect_positive(stride_w, "stride_w", task);
+            expect_non_negative(pad_h, "pad_h", task);
+            expect_non_negative(pad_w, "pad_w", task);
+            int64_t numer_h = in_h + 2 * pad_h - kernel_h;
+            int64_t numer_w = in_w + 2 * pad_w - kernel_w;
+            TVM_FFI_CHECK_GE(numer_h, 0, ValueError)
+                << "Typhoon vector maxpool task " << task.task_id << " has invalid height";
+            TVM_FFI_CHECK_GE(numer_w, 0, ValueError)
+                << "Typhoon vector maxpool task " << task.task_id << " has invalid width";
+            TVM_FFI_CHECK_EQ(out_h, numer_h / stride_h + 1, ValueError)
+                << "Typhoon vector maxpool task " << task.task_id
+                << " has maxpool output height mismatch";
+            TVM_FFI_CHECK_EQ(out_w, numer_w / stride_w + 1, ValueError)
+                << "Typhoon vector maxpool task " << task.task_id
+                << " has maxpool output width mismatch";
+            TVM_FFI_CHECK_EQ(task.elem_count, n * c * out_h * out_w, ValueError)
+                << "Typhoon vector maxpool task " << task.task_id
+                << " has elem_count mismatch";
+            TVM_FFI_CHECK_LE(n * c * in_h * in_w * 4, regions_.at(task.reads[0]).size, ValueError)
+                << "Typhoon vector task " << task.task_id << " has out-of-bounds size mismatch";
+            TVM_FFI_CHECK_LE(task.elem_count * 4, regions_.at(task.writes[0]).size, ValueError)
+                << "Typhoon vector task " << task.task_id << " has out-of-bounds size mismatch";
+            break;
+          }
+          case 3: {
+            TVM_FFI_CHECK_EQ(task.metadata.size(), 4U, ValueError)
+                << "Typhoon vector global_average_pool task " << task.task_id
+                << " expects 4 metadata values";
+            TVM_FFI_CHECK_EQ(task.dtype_code, 2, ValueError)
+                << "Typhoon vector global_average_pool task " << task.task_id
+                << " currently requires dtype_code=2";
+            int64_t n = task.metadata[0];
+            int64_t c = task.metadata[1];
+            int64_t in_h = task.metadata[2];
+            int64_t in_w = task.metadata[3];
+            expect_positive(n, "n", task);
+            expect_positive(c, "c", task);
+            expect_positive(in_h, "in_h", task);
+            expect_positive(in_w, "in_w", task);
+            TVM_FFI_CHECK_EQ(task.elem_count, n * c, ValueError)
+                << "Typhoon vector global_average_pool task " << task.task_id
+                << " has elem_count mismatch";
+            TVM_FFI_CHECK_LE(n * c * in_h * in_w * 4, regions_.at(task.reads[0]).size, ValueError)
+                << "Typhoon vector task " << task.task_id << " has out-of-bounds size mismatch";
+            TVM_FFI_CHECK_LE(task.elem_count * 4, regions_.at(task.writes[0]).size, ValueError)
+                << "Typhoon vector task " << task.task_id << " has out-of-bounds size mismatch";
+            break;
+          }
+          default:
+            TVM_FFI_THROW(ValueError)
+                << "Typhoon vector task " << task.task_id << " uses unsupported op_code "
+                << task.op_code;
+        }
+      } else if (task.kind == "reshape") {
+        switch (task.transform_code) {
+          case 0:
+            TVM_FFI_CHECK(task.metadata.empty(), ValueError)
+                << "Typhoon reshape task " << task.task_id
+                << " does not accept metadata for copy/reorder";
+            TVM_FFI_CHECK_LE(task.elem_count, regions_.at(task.reads[0]).size, ValueError)
+                << "Typhoon reshape task " << task.task_id << " has out-of-bounds size mismatch";
+            TVM_FFI_CHECK_LE(task.elem_count, regions_.at(task.writes[0]).size, ValueError)
+                << "Typhoon reshape task " << task.task_id << " has out-of-bounds size mismatch";
+            break;
+          case 1: {
+            TVM_FFI_CHECK_EQ(task.metadata.size(), 12U, ValueError)
+                << "Typhoon reshape im2col task " << task.task_id
+                << " expects 12 metadata values";
+            int64_t n = task.metadata[0];
+            int64_t c = task.metadata[1];
+            int64_t in_h = task.metadata[2];
+            int64_t in_w = task.metadata[3];
+            int64_t kernel_h = task.metadata[4];
+            int64_t kernel_w = task.metadata[5];
+            int64_t stride_h = task.metadata[6];
+            int64_t stride_w = task.metadata[7];
+            int64_t pad_h = task.metadata[8];
+            int64_t pad_w = task.metadata[9];
+            int64_t out_h = task.metadata[10];
+            int64_t out_w = task.metadata[11];
+            expect_positive(n, "n", task);
+            expect_positive(c, "c", task);
+            expect_positive(in_h, "in_h", task);
+            expect_positive(in_w, "in_w", task);
+            expect_positive(kernel_h, "kernel_h", task);
+            expect_positive(kernel_w, "kernel_w", task);
+            expect_positive(stride_h, "stride_h", task);
+            expect_positive(stride_w, "stride_w", task);
+            expect_non_negative(pad_h, "pad_h", task);
+            expect_non_negative(pad_w, "pad_w", task);
+            int64_t numer_h = in_h + 2 * pad_h - kernel_h;
+            int64_t numer_w = in_w + 2 * pad_w - kernel_w;
+            TVM_FFI_CHECK_GE(numer_h, 0, ValueError)
+                << "Typhoon reshape im2col task " << task.task_id << " has invalid height";
+            TVM_FFI_CHECK_GE(numer_w, 0, ValueError)
+                << "Typhoon reshape im2col task " << task.task_id << " has invalid width";
+            TVM_FFI_CHECK_EQ(out_h, numer_h / stride_h + 1, ValueError)
+                << "Typhoon reshape im2col task " << task.task_id
+                << " has im2col output height mismatch";
+            TVM_FFI_CHECK_EQ(out_w, numer_w / stride_w + 1, ValueError)
+                << "Typhoon reshape im2col task " << task.task_id
+                << " has im2col output width mismatch";
+            TVM_FFI_CHECK_EQ(task.elem_count, n * c * kernel_h * kernel_w * out_h * out_w * 4,
+                             ValueError)
+                << "Typhoon reshape im2col task " << task.task_id
+                << " has elem_count mismatch";
+            TVM_FFI_CHECK_LE(n * c * in_h * in_w * 4, regions_.at(task.reads[0]).size, ValueError)
+                << "Typhoon reshape task " << task.task_id << " has out-of-bounds size mismatch";
+            TVM_FFI_CHECK_LE(task.elem_count, regions_.at(task.writes[0]).size, ValueError)
+                << "Typhoon reshape task " << task.task_id << " has out-of-bounds size mismatch";
+            break;
+          }
+          default:
+            TVM_FFI_THROW(ValueError)
+                << "Typhoon reshape task " << task.task_id
+                << " uses unsupported transform_code " << task.transform_code;
+        }
+      }
+    }
+  }
+
   int64_t sram_size_;
   std::unordered_map<int64_t, TyphoonRegionInfo> regions_;
   std::vector<TyphoonTaskInfo> tasks_;
@@ -392,6 +660,21 @@ class TyphoonGraphVerifier : public StmtExprVisitor {
 
   bool graph_id_seen_{false};
   int64_t graph_id_{-1};
+
+  int64_t DTypeBytes(int64_t dtype_code) const {
+    switch (dtype_code) {
+      case 0:
+        return 1;
+      case 1:
+        return 2;
+      case 2:
+        return 4;
+      case 3:
+        return 8;
+      default:
+        TVM_FFI_THROW(ValueError) << "Typhoon dtype_code " << dtype_code << " is unsupported";
+    }
+  }
 };
 
 }  // namespace
