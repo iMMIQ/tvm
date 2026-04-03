@@ -382,6 +382,17 @@ def VerifyTyphoonGraph():
     return _ffi_api.VerifyTyphoonGraph()  # type: ignore
 
 
+def IdentifyTyphoonResNet18():
+    """Identify fixed-shape ResNet18 stem patterns for Typhoon lowering.
+
+    Returns
+    -------
+    fpass : tvm.transform.Pass
+        The result pass
+    """
+    return _ffi_api.IdentifyTyphoonResNet18()  # type: ignore
+
+
 def LowerTyphoonSubmitGraph():
     """Expand Typhoon submit_graph nodes into GraphBegin + SubmitGraph statements.
 
