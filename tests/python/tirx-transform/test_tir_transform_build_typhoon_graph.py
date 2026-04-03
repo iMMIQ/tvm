@@ -62,6 +62,16 @@ def build_resnet18_stem_tir_module():
     return tvm.IRModule.from_expr(func)
 
 
+def build_multifunc_typhoon_module_with_stem():
+    stem_mod = build_resnet18_stem_tir_module()
+    stem = stem_mod["main"].with_attr("global_symbol", "stem")
+    aux_buffer = tvm.tirx.decl_buffer((4,), "float32", name="aux")
+    aux = tvm.tirx.PrimFunc([aux_buffer], tvm.tirx.Evaluate(0)).with_attr(
+        "global_symbol", "aux"
+    ).with_attr("target", tvm.target.Target({"kind": "typhoon"}))
+    return tvm.IRModule({"stem": stem, "aux": aux})
+
+
 def build_planned_resnet18_conv_block():
     input_buffer = tvm.tirx.decl_buffer((1, 3, 224, 224), "float32", name="input")
     weight_buffer = tvm.tirx.decl_buffer((64, 3, 7, 7), "float32", name="weight")
@@ -172,3 +182,12 @@ def test_finalize_host_passes_auto_builds_typhoon_graph_for_resnet18_stem():
     assert "TVMTyphoonAddMatmulTask" in text
     assert "TVMTyphoonGraphBegin" in text
     assert "TVMTyphoonSubmitGraph" in text
+
+
+def test_finalize_host_passes_auto_builds_typhoon_graph_from_multifunc_module():
+    mod = build_multifunc_typhoon_module_with_stem()
+    out = tvm.tirx.pipeline.finalize_host_passes()(mod)
+    text = out.script()
+    assert "typhoon_resnet18_plan" in out.attrs
+    assert "typhoon_sram_plan" in out.attrs
+    assert "TVMTyphoonAddMatmulTask" in text

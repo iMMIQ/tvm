@@ -97,16 +97,22 @@ bool IsShape(const std::vector<int64_t>& actual, std::initializer_list<int64_t> 
 
 class LoadSourceVerifier : public ExprVisitor {
  public:
-  LoadSourceVerifier(Buffer input, Buffer weight)
-      : input_(std::move(input)), weight_(std::move(weight)) {}
+  LoadSourceVerifier(Buffer primary_input, Buffer secondary_input, Buffer weight)
+      : primary_input_(std::move(primary_input)),
+        secondary_input_(std::move(secondary_input)),
+        weight_(std::move(weight)) {}
 
-  bool saw_input() const { return saw_input_; }
+  bool saw_primary_input() const { return saw_primary_input_; }
+  bool saw_secondary_input() const { return saw_secondary_input_; }
   bool saw_weight() const { return saw_weight_; }
 
  private:
   void VisitExpr_(const BufferLoadNode* op) final {
-    if (op->buffer.same_as(input_)) {
-      saw_input_ = true;
+    if (op->buffer.same_as(primary_input_)) {
+      saw_primary_input_ = true;
+    }
+    if (secondary_input_.defined() && op->buffer.same_as(secondary_input_)) {
+      saw_secondary_input_ = true;
     }
     if (op->buffer.same_as(weight_)) {
       saw_weight_ = true;
@@ -114,9 +120,11 @@ class LoadSourceVerifier : public ExprVisitor {
     ExprVisitor::VisitExpr_(op);
   }
 
-  Buffer input_;
+  Buffer primary_input_;
+  Buffer secondary_input_;
   Buffer weight_;
-  bool saw_input_{false};
+  bool saw_primary_input_{false};
+  bool saw_secondary_input_{false};
   bool saw_weight_{false};
 };
 
@@ -138,10 +146,21 @@ class StemPatternVerifier : public StmtExprVisitor {
   }
 
   void VisitStmt_(const BufferStoreNode* op) final {
+    if (!pad_buffer_.defined()) {
+      std::vector<int64_t> shape = ExpectConstantShape(op->buffer, "pad");
+      if (IsShape(shape, {1, 3, 230, 230})) {
+        LoadSourceVerifier verifier(input_, Buffer(), weight_);
+        verifier(op->value);
+        if (verifier.saw_primary_input()) {
+          pad_buffer_ = op->buffer;
+        }
+      }
+    }
+
     if (op->buffer.same_as(output_)) {
-      LoadSourceVerifier verifier(input_, weight_);
+      LoadSourceVerifier verifier(input_, pad_buffer_, weight_);
       verifier(op->value);
-      if (verifier.saw_input() && verifier.saw_weight()) {
+      if ((verifier.saw_primary_input() || verifier.saw_secondary_input()) && verifier.saw_weight()) {
         matched_store_ = true;
       }
     }
@@ -151,6 +170,7 @@ class StemPatternVerifier : public StmtExprVisitor {
   Buffer input_;
   Buffer weight_;
   Buffer output_;
+  Buffer pad_buffer_;
   bool matched_store_{false};
   std::multiset<int64_t> loop_extents_;
 };

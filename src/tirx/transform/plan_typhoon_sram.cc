@@ -126,7 +126,12 @@ Pass PlanTyphoonSRAM() {
       return mod;
     }
 
-    std::string plan = GetRequiredModuleAttr(mod, "typhoon_resnet18_plan");
+    auto plan_attr = mod->GetAttr<ffi::String>("typhoon_resnet18_plan");
+    if (!plan_attr.has_value()) {
+      return mod;
+    }
+
+    std::string plan = plan_attr.value();
     TVM_FFI_CHECK(plan.find("\"model\":\"resnet18\"") != std::string::npos ||
                       plan.find("\"model\": \"resnet18\"") != std::string::npos,
                   ValueError)

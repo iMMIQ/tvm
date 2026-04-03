@@ -31,6 +31,10 @@ def _is_typhoon_primfunc(func):
     return attrs["target"].kind.name == "typhoon"
 
 
+def _typhoon_primfunc_items(mod):
+    return [(gvar, func) for gvar, func in mod.functions.items() if _is_typhoon_primfunc(func)]
+
+
 def _module_has_typhoon_graph_ir(mod):
     for _, func in mod.functions.items():
         if not _is_typhoon_primfunc(func):
@@ -41,17 +45,58 @@ def _module_has_typhoon_graph_ir(mod):
     return False
 
 
+def _run_typhoon_graph_build(mod):
+    attrs = mod.attrs or {}
+    if "typhoon_resnet18_plan" not in attrs:
+        mod = tirx.transform.IdentifyTyphoonResNet18()(mod)
+        attrs = mod.attrs or {}
+    if "typhoon_resnet18_plan" not in attrs:
+        return None
+    if "typhoon_sram_plan" not in attrs:
+        mod = tirx.transform.PlanTyphoonSRAM()(mod)
+    return tirx.transform.BuildTyphoonGraph()(mod)
+
+
 @tvm.transform.module_pass(opt_level=0, name="tirx.MaybeBuildTyphoonGraph")
 def _maybe_build_typhoon_graph(mod, _ctx):
     if _module_has_typhoon_graph_ir(mod):
         return mod
 
-    attrs = mod.attrs or {}
-    if "typhoon_resnet18_plan" not in attrs:
-        mod = tirx.transform.IdentifyTyphoonResNet18()(mod)
-    if "typhoon_sram_plan" not in attrs:
-        mod = tirx.transform.PlanTyphoonSRAM()(mod)
-    return tirx.transform.BuildTyphoonGraph()(mod)
+    typhoon_funcs = _typhoon_primfunc_items(mod)
+    if not typhoon_funcs:
+        return mod
+
+    if len(typhoon_funcs) == 1:
+        try:
+            built = _run_typhoon_graph_build(mod)
+        except ValueError:
+            return mod
+        return mod if built is None else built
+
+    candidates = []
+    for gvar, func in typhoon_funcs:
+        try:
+            built = _run_typhoon_graph_build(tvm.IRModule({gvar: func}, attrs=mod.attrs))
+        except ValueError:
+            continue
+        if built is not None:
+            candidates.append((gvar, built))
+
+    if len(candidates) != 1:
+        return mod
+
+    gvar, built = candidates[0]
+    helper_name = f"{gvar.name_hint}_typhoon_graph"
+    helper_gvar = tvm.ir.GlobalVar(helper_name)
+    helper_func = built[gvar].with_attr("global_symbol", helper_name)
+    merged = tvm.IRModule(
+        {**dict(mod.functions), helper_gvar: helper_func},
+        attrs=mod.attrs,
+    )
+    for key in ("typhoon_resnet18_plan", "typhoon_sram_plan"):
+        if built.attrs and key in built.attrs:
+            merged = merged.with_attr(key, built.attrs[key])
+    return merged
 
 
 def finalize_host_passes():  # pylint: disable=unused-argument

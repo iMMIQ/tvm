@@ -51,6 +51,97 @@ def _make_body(input_buffer, weight_buffer, output_buffer, body_kind):
                 ),
             ),
         )
+    if body_kind == "padded_stem":
+        pad_buffer = tvm.tirx.decl_buffer((1, 3, 230, 230), "float32", name="pad_temp")
+        nn = tvm.tirx.Var("nn", "int32")
+        cc = tvm.tirx.Var("cc", "int32")
+        yy = tvm.tirx.Var("yy", "int32")
+        xx = tvm.tirx.Var("xx", "int32")
+        rc = tvm.tirx.Var("rc", "int32")
+        ry = tvm.tirx.Var("ry", "int32")
+        rx = tvm.tirx.Var("rx", "int32")
+        pi = tvm.tirx.Var("pi", "int32")
+        pj = tvm.tirx.Var("pj", "int32")
+        pad_store = tvm.tirx.BufferStore(
+            pad_buffer,
+            tvm.tirx.if_then_else(
+                tvm.tirx.all(pi >= 3, pi < 227, pj >= 3, pj < 227),
+                tvm.tirx.BufferLoad(input_buffer, [0, cc, pi - 3, pj - 3]),
+                tvm.tirx.const(0, "float32"),
+            ),
+            [0, cc, pi, pj],
+        )
+        conv_store = tvm.tirx.BufferStore(
+            output_buffer,
+            tvm.tirx.BufferLoad(output_buffer, [nn, yy, xx, cc])
+            + tvm.tirx.BufferLoad(pad_buffer, [nn, rc, yy * 2 + ry, xx * 2 + rx])
+            * tvm.tirx.BufferLoad(weight_buffer, [cc, rc, ry, rx]),
+            [nn, yy, xx, cc],
+        )
+        return tvm.tirx.stmt_seq(
+            tvm.tirx.For(
+                cc,
+                tvm.tirx.const(0, "int32"),
+                tvm.tirx.const(3, "int32"),
+                tvm.tirx.ForKind.SERIAL,
+                tvm.tirx.For(
+                    pi,
+                    tvm.tirx.const(0, "int32"),
+                    tvm.tirx.const(230, "int32"),
+                    tvm.tirx.ForKind.SERIAL,
+                    tvm.tirx.For(
+                        pj,
+                        tvm.tirx.const(0, "int32"),
+                        tvm.tirx.const(230, "int32"),
+                        tvm.tirx.ForKind.SERIAL,
+                        pad_store,
+                    ),
+                ),
+            ),
+            tvm.tirx.For(
+                nn,
+                tvm.tirx.const(0, "int32"),
+                tvm.tirx.const(1, "int32"),
+                tvm.tirx.ForKind.SERIAL,
+                tvm.tirx.For(
+                    cc,
+                    tvm.tirx.const(0, "int32"),
+                    tvm.tirx.const(64, "int32"),
+                    tvm.tirx.ForKind.SERIAL,
+                    tvm.tirx.For(
+                        yy,
+                        tvm.tirx.const(0, "int32"),
+                        tvm.tirx.const(112, "int32"),
+                        tvm.tirx.ForKind.SERIAL,
+                        tvm.tirx.For(
+                            xx,
+                            tvm.tirx.const(0, "int32"),
+                            tvm.tirx.const(112, "int32"),
+                            tvm.tirx.ForKind.SERIAL,
+                            tvm.tirx.For(
+                                rc,
+                                tvm.tirx.const(0, "int32"),
+                                tvm.tirx.const(3, "int32"),
+                                tvm.tirx.ForKind.SERIAL,
+                                tvm.tirx.For(
+                                    ry,
+                                    tvm.tirx.const(0, "int32"),
+                                    tvm.tirx.const(7, "int32"),
+                                    tvm.tirx.ForKind.SERIAL,
+                                    tvm.tirx.For(
+                                        rx,
+                                        tvm.tirx.const(0, "int32"),
+                                        tvm.tirx.const(7, "int32"),
+                                        tvm.tirx.ForKind.SERIAL,
+                                        conv_store,
+                                    ),
+                                ),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        )
     if body_kind == "trivial":
         return tvm.tirx.Evaluate(0)
     raise ValueError(f"Unsupported body_kind: {body_kind}")
@@ -100,6 +191,10 @@ def build_trivial_body_resnet18_stem_module():
     return _make_mod((1, 3, 224, 224), (1, 64, 112, 112), body_kind="trivial")
 
 
+def build_padded_resnet18_stem_module():
+    return _make_mod((1, 3, 224, 224), (1, 64, 112, 112), body_kind="padded_stem")
+
+
 def test_typhoon_resnet18_rejects_non_resnet18_graph():
     mod = build_non_resnet18_tir_module()
     with pytest.raises(ValueError, match="ResNet18"):
@@ -146,3 +241,9 @@ def test_typhoon_resnet18_accepts_fixed_shape_resnet18_conv_stem():
     assert plan["layers"][0]["op_name"] == "stem_conv"
     assert plan["layers"][0]["block_id"] == 0
     assert plan["layers"][0]["weight_shape"] == [64, 3, 7, 7]
+
+
+def test_typhoon_resnet18_accepts_padded_stem_lowering_form():
+    mod = build_padded_resnet18_stem_module()
+    out = tvm.tirx.transform.IdentifyTyphoonResNet18()(mod)
+    assert "typhoon_resnet18_plan" in out.attrs
