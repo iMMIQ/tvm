@@ -18,18 +18,145 @@
  */
 
 #include "typhoon_graph.h"
+#include "typhoon_scheduler.h"
 
+#include <algorithm>
+#include <cstring>
 #include <tvm/ffi/function.h>
 #include <tvm/ffi/reflection/registry.h>
 
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 namespace tvm {
 namespace runtime {
 namespace typhoon {
+
+namespace {
+
+const TyphoonRegion& FindRegion(const TyphoonGraphBuilder& graph, int32_t region_id) {
+  for (const auto& region : graph.regions()) {
+    if (region.region_id == region_id) {
+      return region;
+    }
+  }
+  throw std::runtime_error("Unknown Typhoon region " + std::to_string(region_id));
+}
+
+template <typename T = uint8_t>
+T* SramPtr(std::vector<uint8_t>* sram, const TyphoonRegion& region) {
+  return reinterpret_cast<T*>(sram->data() + region.offset);
+}
+
+void ExecuteTask(const TyphoonGraphBuilder& graph, const TyphoonTask& task, std::vector<uint8_t>* sram) {
+  switch (task.kind) {
+    case TaskKind::kDMA: {
+      const auto& region =
+          task.direction == 0 ? FindRegion(graph, task.writes.at(0)) : FindRegion(graph, task.reads.at(0));
+      uint8_t* sram_ptr = SramPtr<>(sram, region);
+      uint8_t* global_ptr = reinterpret_cast<uint8_t*>(task.global_endpoint.handle) + task.global_endpoint.byte_offset;
+      if (task.direction == 0) {
+        std::memcpy(sram_ptr, global_ptr, static_cast<size_t>(task.bytes));
+      } else {
+        std::memcpy(global_ptr, sram_ptr, static_cast<size_t>(task.bytes));
+      }
+      return;
+    }
+    case TaskKind::kReshape: {
+      const auto& input = FindRegion(graph, task.reads.at(0));
+      const auto& output = FindRegion(graph, task.writes.at(0));
+      std::memcpy(SramPtr<>(sram, output), SramPtr<>(sram, input), static_cast<size_t>(task.elem_count));
+      return;
+    }
+    case TaskKind::kVector: {
+      if (task.dtype_code != 2) {
+        throw std::runtime_error("Typhoon vector execution currently supports dtype_code=2 only");
+      }
+      const auto& in0 = FindRegion(graph, task.reads.at(0));
+      const auto& in1 = FindRegion(graph, task.reads.at(1));
+      const auto& out = FindRegion(graph, task.writes.at(0));
+      auto* in0_ptr = SramPtr<float>(sram, in0);
+      auto* in1_ptr = SramPtr<float>(sram, in1);
+      auto* out_ptr = SramPtr<float>(sram, out);
+      for (int64_t i = 0; i < task.elem_count; ++i) {
+        if (task.op_code == 0) {
+          out_ptr[i] = in0_ptr[i] + in1_ptr[i];
+        } else {
+          out_ptr[i] = in0_ptr[i];
+        }
+      }
+      return;
+    }
+    case TaskKind::kMatmul: {
+      if (task.dtype_code != 2) {
+        throw std::runtime_error("Typhoon matmul execution currently supports dtype_code=2 only");
+      }
+      const auto& a = FindRegion(graph, task.reads.at(0));
+      const auto& b = FindRegion(graph, task.reads.at(1));
+      const auto& c = FindRegion(graph, task.writes.at(0));
+      auto* a_ptr = SramPtr<float>(sram, a);
+      auto* b_ptr = SramPtr<float>(sram, b);
+      auto* c_ptr = SramPtr<float>(sram, c);
+      for (int64_t i = 0; i < task.m; ++i) {
+        for (int64_t j = 0; j < task.n; ++j) {
+          float acc = 0.0f;
+          for (int64_t kk = 0; kk < task.k; ++kk) {
+            acc += a_ptr[i * task.k + kk] * b_ptr[kk * task.n + j];
+          }
+          c_ptr[i * task.n + j] = acc;
+        }
+      }
+      return;
+    }
+  }
+}
+
+void ExecuteGraph(const TyphoonGraphBuilder& graph) {
+  const auto& tasks = graph.tasks();
+  std::unordered_map<int32_t, size_t> task_index = graph.task_index();
+  std::vector<int> remaining_deps(tasks.size(), 0);
+  std::vector<std::vector<size_t>> users(tasks.size());
+  for (size_t i = 0; i < tasks.size(); ++i) {
+    remaining_deps[i] = static_cast<int>(tasks[i].deps.size());
+    for (int32_t dep_id : tasks[i].deps) {
+      users.at(task_index.at(dep_id)).push_back(i);
+    }
+  }
+
+  std::vector<uint8_t> sram(kTyphoonDefaultSRAMSize, 0);
+  std::vector<size_t> ready;
+  for (size_t i = 0; i < tasks.size(); ++i) {
+    if (remaining_deps[i] == 0) {
+      ready.push_back(i);
+    }
+  }
+
+  auto ready_cmp = [&tasks](size_t lhs, size_t rhs) {
+    if (tasks[lhs].task_id != tasks[rhs].task_id) {
+      return tasks[lhs].task_id < tasks[rhs].task_id;
+    }
+    return lhs < rhs;
+  };
+
+  while (!ready.empty()) {
+    std::sort(ready.begin(), ready.end(), ready_cmp);
+    size_t current = ready.front();
+    ready.erase(ready.begin());
+    ExecuteTask(graph, tasks[current], &sram);
+    for (size_t user : users[current]) {
+      --remaining_deps[user];
+      if (remaining_deps[user] == 0) {
+        ready.push_back(user);
+      }
+    }
+  }
+}
+
+}  // namespace
 
 class TyphoonRuntimeState {
  public:
@@ -42,11 +169,17 @@ class TyphoonRuntimeState {
     std::lock_guard<std::mutex> lock(mu_);
     graphs_.clear();
     last_error_.clear();
+    last_trace_json_ = "[]";
   }
 
   std::string LastError() const {
     std::lock_guard<std::mutex> lock(mu_);
     return last_error_;
+  }
+
+  std::string LastTraceJSON() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return last_trace_json_;
   }
 
   int GraphBegin(int32_t graph_id) {
@@ -102,7 +235,12 @@ class TyphoonRuntimeState {
   }
 
   int SubmitGraph(int32_t graph_id) {
-    return Call([&]() { GetOrCreateGraph(graph_id).Submit(); });
+    return Call([&]() {
+      auto& graph = GetOrCreateGraph(graph_id);
+      graph.Submit();
+      ExecuteGraph(graph);
+      last_trace_json_ = SerializeTraceToJSON(TyphoonScheduler().Run(graph));
+    });
   }
 
   int WaitGraph(int32_t graph_id) {
@@ -141,6 +279,7 @@ class TyphoonRuntimeState {
   mutable std::mutex mu_;
   std::unordered_map<int32_t, TyphoonGraphBuilder> graphs_;
   std::string last_error_;
+  std::string last_trace_json_{"[]"};
 };
 
 }  // namespace typhoon
@@ -214,6 +353,8 @@ TVM_FFI_STATIC_INIT_BLOCK() {
                         []() { TyphoonRuntimeState::Global().ResetForTesting(); });
   refl::GlobalDef().def("runtime.typhoon.testing_last_error",
                         []() { return TyphoonRuntimeState::Global().LastError(); });
+  refl::GlobalDef().def("runtime.typhoon_get_last_trace_json",
+                        []() { return TyphoonRuntimeState::Global().LastTraceJSON(); });
 }
 
 }  // namespace typhoon

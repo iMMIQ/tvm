@@ -60,12 +60,23 @@ struct TyphoonTask {
   std::vector<int32_t> writes;
   GlobalEndpoint global_endpoint;
   int32_t direction{0};
+  int32_t op_code{0};
   int64_t bytes{0};
   int64_t elem_count{0};
   int32_t dtype_code{0};
   int64_t m{0};
   int64_t n{0};
   int64_t k{0};
+};
+
+struct TyphoonTraceRecord {
+  int32_t task_id{0};
+  std::string kind;
+  std::string resource;
+  int64_t start_time{0};
+  int64_t end_time{0};
+  int64_t sram_bytes_read{0};
+  int64_t sram_bytes_written{0};
 };
 
 }  // namespace typhoon

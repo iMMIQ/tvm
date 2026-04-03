@@ -111,9 +111,9 @@ void TyphoonGraphBuilder::AddVectorTask(int32_t task_id, int32_t op_code, int32_
   task.deps = CopyDeps(num_deps, dep_ids);
   task.reads = {in0_region_id, in1_region_id};
   task.writes = {out_region_id};
+  task.op_code = op_code;
   task.elem_count = elem_count;
   task.dtype_code = dtype_code;
-  (void)op_code;
   AddTask(std::move(task));
 }
 

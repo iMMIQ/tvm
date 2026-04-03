@@ -16,6 +16,7 @@
 # under the License.
 
 import ctypes
+import json
 import os
 
 import pytest
@@ -81,9 +82,11 @@ def _runtime():
 
     reset = tvm.get_global_func("runtime.typhoon.testing_reset", allow_missing=True)
     last_error = tvm.get_global_func("runtime.typhoon.testing_last_error", allow_missing=True)
+    get_trace = tvm.get_global_func("runtime.typhoon_get_last_trace_json", allow_missing=True)
     assert reset is not None
     assert last_error is not None
-    return lib, reset, last_error
+    assert get_trace is not None
+    return lib, reset, last_error, get_trace
 
 
 def _dep_buffer(dep_ids):
@@ -100,7 +103,7 @@ def _check_ok(last_error, code):
 
 
 def _run_graph(**flags):
-    lib, reset, last_error = _runtime()
+    lib, reset, last_error, _ = _runtime()
     reset()
     graph_id = 41
 
@@ -192,3 +195,41 @@ def test_typhoon_rejects_dma_bytes_larger_than_region():
 def test_typhoon_rejects_vector_output_larger_than_region():
     with pytest.raises(RuntimeError, match="out-of-bounds|size mismatch"):
         _run_graph(vector_output_too_large=True)
+
+
+def _run_and_get_trace():
+    lib, reset, last_error, get_trace = _runtime()
+    reset()
+    graph_id = 52
+
+    _check_ok(last_error, lib.TVMTyphoonDeclareRegion(graph_id, 0, 0, 256, 64, 1, b"input"))
+    _check_ok(last_error, lib.TVMTyphoonDeclareRegion(graph_id, 1, 256, 256, 64, 0, b"left"))
+    _check_ok(last_error, lib.TVMTyphoonDeclareRegion(graph_id, 2, 512, 256, 64, 0, b"right"))
+
+    num_deps, dep_ids = _dep_buffer([])
+    _check_ok(last_error, lib.TVMTyphoonAddReshapeTask(graph_id, 2, 0, 2, 64, 0, num_deps, dep_ids))
+    _check_ok(last_error, lib.TVMTyphoonAddReshapeTask(graph_id, 1, 0, 1, 64, 0, num_deps, dep_ids))
+    _check_ok(last_error, lib.TVMTyphoonGraphBegin(graph_id))
+    _check_ok(last_error, lib.TVMTyphoonSubmitGraph(graph_id))
+    _check_ok(last_error, lib.TVMTyphoonWaitGraph(graph_id))
+    return json.loads(get_trace())
+
+
+def test_typhoon_scheduler_is_deterministic():
+    trace_a = _run_and_get_trace()
+    trace_b = _run_and_get_trace()
+    assert trace_a == trace_b
+
+
+def test_typhoon_trace_has_required_fields():
+    trace = _run_and_get_trace()
+    assert trace
+    assert {
+        "task_id",
+        "kind",
+        "resource",
+        "start_time",
+        "end_time",
+        "sram_bytes_read",
+        "sram_bytes_written",
+    } <= set(trace[0])

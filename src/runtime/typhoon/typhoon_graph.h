@@ -54,6 +54,11 @@ class TyphoonGraphBuilder {
                       const int32_t* dep_ids);
   void Submit();
   void Wait() const;
+  int32_t graph_id() const { return graph_id_; }
+  bool began() const { return began_; }
+  const std::vector<TyphoonRegion>& regions() const { return regions_; }
+  const std::vector<TyphoonTask>& tasks() const { return tasks_; }
+  const std::unordered_map<int32_t, size_t>& task_index() const { return task_index_; }
 
  private:
   std::vector<int32_t> CopyDeps(int32_t num_deps, const int32_t* dep_ids) const;
