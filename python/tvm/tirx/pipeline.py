@@ -27,6 +27,8 @@ def finalize_host_passes():  # pylint: disable=unused-argument
     host_pass_list = [
         tirx.transform.LowerTVMBuiltin(),
         tirx.transform.LowerCustomDatatypes(),
+        tirx.transform.LowerTyphoonTaskDeps(),
+        tirx.transform.LowerTyphoonSubmitGraph(),
         tirx.transform.LowerIntrin(),
     ]
     return tvm.ir.transform.Sequential(host_pass_list)

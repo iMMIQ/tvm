@@ -24,10 +24,11 @@ def _task_args(args, deps):
     return [*args, len(deps), *deps]
 
 
-def region_decl(region_id, offset, size, alignment, preinitialized, tag, span=None):
+def region_decl(graph_id, region_id, offset, size, alignment, preinitialized, tag, span=None):
     call = tvm.tirx.call_intrin(
         "int32",
         "tirx.typhoon.region_decl",
+        graph_id,
         region_id,
         offset,
         size,
@@ -40,6 +41,7 @@ def region_decl(region_id, offset, size, alignment, preinitialized, tag, span=No
 
 
 def task_dma(
+    graph_id,
     task_id,
     direction,
     global_handle,
@@ -53,7 +55,8 @@ def task_dma(
         "int32",
         "tirx.typhoon.task_dma",
         *_task_args(
-            [task_id, direction, global_handle, global_byte_offset, sram_region_id, bytes], deps
+            [graph_id, task_id, direction, global_handle, global_byte_offset, sram_region_id, bytes],
+            deps,
         ),
         span=span,
     )
@@ -61,6 +64,7 @@ def task_dma(
 
 
 def task_matmul(
+    graph_id,
     task_id,
     a_region_id,
     b_region_id,
@@ -77,7 +81,18 @@ def task_matmul(
         "int32",
         "tirx.typhoon.task_matmul",
         *_task_args(
-            [task_id, a_region_id, b_region_id, c_region_id, m, n, k, dtype_code, layout_code],
+            [
+                graph_id,
+                task_id,
+                a_region_id,
+                b_region_id,
+                c_region_id,
+                m,
+                n,
+                k,
+                dtype_code,
+                layout_code,
+            ],
             deps,
         ),
         span=span,
@@ -86,6 +101,7 @@ def task_matmul(
 
 
 def task_vector(
+    graph_id,
     task_id,
     op_code,
     in0_region_id,
@@ -101,6 +117,7 @@ def task_vector(
         "tirx.typhoon.task_vector",
         *_task_args(
             [
+                graph_id,
                 task_id,
                 op_code,
                 in0_region_id,
@@ -117,6 +134,7 @@ def task_vector(
 
 
 def task_reshape(
+    graph_id,
     task_id,
     in_region_id,
     out_region_id,
@@ -128,7 +146,9 @@ def task_reshape(
     call = tvm.tirx.call_intrin(
         "int32",
         "tirx.typhoon.task_reshape",
-        *_task_args([task_id, in_region_id, out_region_id, elem_count, transform_code], deps),
+        *_task_args(
+            [graph_id, task_id, in_region_id, out_region_id, elem_count, transform_code], deps
+        ),
         span=span,
     )
     return tvm.tirx.Evaluate(call)

@@ -226,6 +226,22 @@ static constexpr const char* kDisableLowerTVMBuiltin = "disable_lower_builtin";
 TVM_DLL Pass LowerTVMBuiltin();
 
 /*!
+ * \brief Expand Typhoon submit_graph nodes into an explicit graph-begin statement
+ *        followed by the original submit_graph node.
+ *
+ * \return The pass.
+ */
+TVM_DLL Pass LowerTyphoonSubmitGraph();
+
+/*!
+ * \brief Materialize Typhoon task dependency lists into stack arrays that match
+ *        the runtime ABI.
+ *
+ * \return The pass.
+ */
+TVM_DLL Pass LowerTyphoonTaskDeps();
+
+/*!
  * \brief Lower the target specific function intrinsics in each of the function.
  *
  * \return The pass.

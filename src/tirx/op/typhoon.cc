@@ -31,7 +31,7 @@ namespace tirx {
   TVM_TIR_REGISTER_OP("typhoon." OpName)                                                   \
       .set_attr<TCallEffectKind>("TCallEffectKind", Integer(CallEffectKind::kOpaque))
 
-TVM_TIR_REGISTER_TYPHOON_OP("region_decl").set_num_inputs(6);
+TVM_TIR_REGISTER_TYPHOON_OP("region_decl").set_num_inputs(7);
 TVM_TIR_REGISTER_TYPHOON_OP("task_dma");
 TVM_TIR_REGISTER_TYPHOON_OP("task_matmul");
 TVM_TIR_REGISTER_TYPHOON_OP("task_vector");

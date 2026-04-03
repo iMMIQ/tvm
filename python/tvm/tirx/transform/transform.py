@@ -371,6 +371,28 @@ def LowerTVMBuiltin():
     return _ffi_api.LowerTVMBuiltin()  # type: ignore
 
 
+def LowerTyphoonSubmitGraph():
+    """Expand Typhoon submit_graph nodes into GraphBegin + SubmitGraph statements.
+
+    Returns
+    -------
+    fpass : tvm.transform.Pass
+        The result pass
+    """
+    return _ffi_api.LowerTyphoonSubmitGraph()  # type: ignore
+
+
+def LowerTyphoonTaskDeps():
+    """Materialize Typhoon task dependency lists into runtime ABI stack arrays.
+
+    Returns
+    -------
+    fpass : tvm.transform.Pass
+        The result pass
+    """
+    return _ffi_api.LowerTyphoonTaskDeps()  # type: ignore
+
+
 def LowerIntrin():
     """Lower target specific intrinsic calls.
 

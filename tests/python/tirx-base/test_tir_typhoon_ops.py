@@ -19,10 +19,13 @@ import tvm
 
 
 def test_typhoon_region_and_task_builders():
-    region = tvm.tirx.typhoon.region_decl(0, 0, 4096, 64, 0, "A")
-    task = tvm.tirx.typhoon.task_matmul(1, 0, 1, 2, 64, 64, 64, 1, 0, [])
+    region = tvm.tirx.typhoon.region_decl(7, 0, 0, 4096, 64, 0, "A")
+    task = tvm.tirx.typhoon.task_matmul(7, 1, 0, 1, 2, 64, 64, 64, 1, 0, [4, 9])
 
     assert isinstance(region, tvm.tirx.Evaluate)
     assert isinstance(task, tvm.tirx.Evaluate)
     assert region.value.op.name == "tirx.typhoon.region_decl"
     assert task.value.op.name == "tirx.typhoon.task_matmul"
+    assert [arg.value for arg in region.value.args[:6]] == [7, 0, 0, 4096, 64, 0]
+    assert region.value.args[6].value == "A"
+    assert [arg.value for arg in task.value.args] == [7, 1, 0, 1, 2, 64, 64, 64, 1, 0, 2, 4, 9]
