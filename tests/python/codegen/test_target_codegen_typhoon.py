@@ -52,19 +52,22 @@ def _graph_module(params, *stmts):
     return tvm.IRModule.from_expr(func)
 
 
-def _build_dma_matmul_dma_module():
-    a = tvm.tirx.decl_buffer((2, 2), "float32", name="A")
-    b = tvm.tirx.decl_buffer((2, 2), "float32", name="B")
-    c = tvm.tirx.decl_buffer((2, 2), "float32", name="C")
+def _build_dma_matmul_dma_module(m=2, n=2, k=2):
+    a = tvm.tirx.decl_buffer((m, k), "float32", name="A")
+    b = tvm.tirx.decl_buffer((k, n), "float32", name="B")
+    c = tvm.tirx.decl_buffer((m, n), "float32", name="C")
+    a_bytes = m * k * 4
+    b_bytes = k * n * 4
+    c_bytes = m * n * 4
     return _graph_module(
         [a, b, c],
-        tvm.tirx.typhoon.region_decl(7, 0, 0, 16, 16, 0, "lhs"),
-        tvm.tirx.typhoon.region_decl(7, 1, 16, 16, 16, 0, "rhs"),
-        tvm.tirx.typhoon.region_decl(7, 2, 32, 16, 16, 0, "out"),
-        tvm.tirx.typhoon.task_dma(7, 1, 0, a.data, 0, 0, 16, []),
-        tvm.tirx.typhoon.task_dma(7, 2, 0, b.data, 0, 1, 16, []),
-        tvm.tirx.typhoon.task_matmul(7, 3, 0, 1, 2, 2, 2, 2, 2, 0, [1, 2]),
-        tvm.tirx.typhoon.task_dma(7, 4, 1, c.data, 0, 2, 16, [3]),
+        tvm.tirx.typhoon.region_decl(7, 0, 0, a_bytes, 16, 0, "lhs"),
+        tvm.tirx.typhoon.region_decl(7, 1, a_bytes, b_bytes, 16, 0, "rhs"),
+        tvm.tirx.typhoon.region_decl(7, 2, a_bytes + b_bytes, c_bytes, 16, 0, "out"),
+        tvm.tirx.typhoon.task_dma(7, 1, 0, a.data, 0, 0, a_bytes, []),
+        tvm.tirx.typhoon.task_dma(7, 2, 0, b.data, 0, 1, b_bytes, []),
+        tvm.tirx.typhoon.task_matmul(7, 3, 0, 1, 2, m, n, k, 2, 0, [1, 2]),
+        tvm.tirx.typhoon.task_dma(7, 4, 1, c.data, 0, 2, c_bytes, [3]),
         tvm.tirx.typhoon.submit_graph(7),
         tvm.tirx.typhoon.wait_graph(7),
     )
@@ -166,3 +169,21 @@ def test_typhoon_mixed_reshape_vector_matmul_roundtrip():
 def test_typhoon_invalid_sram_usage_raises_clear_error():
     with pytest.raises(ValueError, match="overlap|bounds"):
         _jit_module(_build_invalid_sram_module())
+
+
+def estimate_matmul_latency(m, n, k):
+    mod = _build_dma_matmul_dma_module(m=m, n=n, k=k)
+    fn = _jit_module(mod)["main"]
+    out = _tensor(np.zeros((m, n), dtype="float32"))
+
+    fn(_tensor(np.ones((m, k), dtype="float32")), _tensor(np.ones((k, n), dtype="float32")), out)
+
+    trace = _get_typhoon_trace()
+    matmul = next(record for record in trace if record["kind"] == "matmul")
+    return matmul["end_time"] - matmul["start_time"]
+
+
+def test_typhoon_cost_model_penalizes_smaller_tiles():
+    big = estimate_matmul_latency(m=64, n=64, k=64)
+    small = estimate_matmul_latency(m=32, n=32, k=32) * 8
+    assert small > big

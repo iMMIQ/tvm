@@ -52,6 +52,21 @@ def _runtime():
         ctypes.POINTER(ctypes.c_int32),
     ]
     lib.TVMTyphoonAddDMATask.restype = ctypes.c_int
+    lib.TVMTyphoonAddMatmulTask.argtypes = [
+        ctypes.c_int32,
+        ctypes.c_int32,
+        ctypes.c_int32,
+        ctypes.c_int32,
+        ctypes.c_int32,
+        ctypes.c_int64,
+        ctypes.c_int64,
+        ctypes.c_int64,
+        ctypes.c_int32,
+        ctypes.c_int32,
+        ctypes.c_int32,
+        ctypes.POINTER(ctypes.c_int32),
+    ]
+    lib.TVMTyphoonAddMatmulTask.restype = ctypes.c_int
     lib.TVMTyphoonAddVectorTask.argtypes = [
         ctypes.c_int32,
         ctypes.c_int32,
@@ -124,6 +139,11 @@ def _add_vector_task(lib, last_error, *base_args, metadata=(), deps=()):
             *base_args, num_metadata, metadata_ptr, num_deps, dep_ids
         ),
     )
+
+
+def _add_matmul_task(lib, last_error, *base_args, deps=()):
+    num_deps, dep_ids = _dep_buffer(deps)
+    _check_ok(last_error, lib.TVMTyphoonAddMatmulTask(*base_args, num_deps, dep_ids))
 
 
 def _add_reshape_task(lib, last_error, *base_args, metadata=(), deps=()):
@@ -257,6 +277,51 @@ def test_typhoon_scheduler_is_deterministic():
     trace_a = _run_and_get_trace()
     trace_b = _run_and_get_trace()
     assert trace_a == trace_b
+
+
+def _trace_duration(trace, task_kind):
+    record = next(record for record in trace if record["kind"] == task_kind)
+    return record["end_time"] - record["start_time"]
+
+
+def _single_task_trace(task_kind):
+    lib, reset, last_error, get_trace = _runtime()
+    reset()
+    graph_id = 77
+
+    _check_ok(last_error, lib.TVMTyphoonDeclareRegion(graph_id, 0, 0, 64, 16, 1, b"in0"))
+    _check_ok(last_error, lib.TVMTyphoonDeclareRegion(graph_id, 1, 64, 64, 16, 1, b"in1"))
+    _check_ok(last_error, lib.TVMTyphoonDeclareRegion(graph_id, 2, 128, 64, 16, 0, b"out"))
+
+    if task_kind == "dma":
+        num_deps, dep_ids = _dep_buffer([])
+        _check_ok(
+            last_error,
+            lib.TVMTyphoonAddDMATask(
+                graph_id, 1, 0, ctypes.c_void_p(1), 0, 2, 0, num_deps, dep_ids
+            ),
+        )
+    elif task_kind == "matmul":
+        _add_matmul_task(lib, last_error, graph_id, 1, 0, 1, 2, 0, 0, 0, 2, 0)
+    elif task_kind == "vector":
+        _add_vector_task(lib, last_error, graph_id, 1, 1, 0, 0, 2, 0, 2)
+    elif task_kind == "reshape":
+        _add_reshape_task(lib, last_error, graph_id, 1, 0, 2, 0, 0)
+    else:
+        raise AssertionError(f"unsupported task kind: {task_kind}")
+
+    _check_ok(last_error, lib.TVMTyphoonGraphBegin(graph_id))
+    _check_ok(last_error, lib.TVMTyphoonSubmitGraph(graph_id))
+    _check_ok(last_error, lib.TVMTyphoonWaitGraph(graph_id))
+    return json.loads(get_trace())
+
+
+def test_typhoon_cost_model_uses_common_fixed_noise_across_task_kinds():
+    latencies = {
+        task_kind: _trace_duration(_single_task_trace(task_kind), task_kind)
+        for task_kind in ("dma", "matmul", "vector", "reshape")
+    }
+    assert len(set(latencies.values())) == 1, latencies
 
 
 def test_typhoon_trace_has_required_fields():

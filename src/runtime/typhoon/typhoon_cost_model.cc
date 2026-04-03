@@ -49,23 +49,26 @@ int64_t DivRoundUp(int64_t value, int64_t divisor) {
   return (value + divisor - 1) / divisor;
 }
 
+int64_t EstimateLatencyFromWorkload(int64_t workload_term, const TyphoonHWConfig& hw) {
+  return std::max<int64_t>(1, hw.common_fixed_noise_cycles + workload_term);
+}
+
 }  // namespace
 
 int64_t EstimateLatency(const TyphoonTask& task, const TyphoonHWConfig& hw) {
   switch (task.kind) {
     case TaskKind::kDMA:
-      return std::max<int64_t>(1, hw.dma_launch_cycles + DivRoundUp(task.bytes, hw.dma_bytes_per_cycle));
+      return EstimateLatencyFromWorkload(DivRoundUp(task.bytes, hw.dma_bytes_per_cycle), hw);
     case TaskKind::kMatmul: {
       int64_t ops = task.m * task.n * task.k;
-      return std::max<int64_t>(1,
-                               hw.matmul_launch_cycles + DivRoundUp(ops, hw.matmul_ops_per_cycle));
+      return EstimateLatencyFromWorkload(DivRoundUp(ops, hw.matmul_ops_per_cycle), hw);
     }
     case TaskKind::kVector:
-      return std::max<int64_t>(
-          1, hw.vector_launch_cycles + DivRoundUp(task.elem_count, hw.vector_elems_per_cycle));
+      return EstimateLatencyFromWorkload(DivRoundUp(task.elem_count, hw.vector_elems_per_cycle),
+                                         hw);
     case TaskKind::kReshape:
-      return std::max<int64_t>(
-          1, hw.reshape_launch_cycles + DivRoundUp(task.elem_count, hw.reshape_bytes_per_cycle));
+      return EstimateLatencyFromWorkload(DivRoundUp(task.elem_count, hw.reshape_bytes_per_cycle),
+                                         hw);
   }
   return 1;
 }

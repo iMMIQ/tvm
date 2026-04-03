@@ -29,13 +29,10 @@ namespace runtime {
 namespace typhoon {
 
 struct TyphoonHWConfig {
-  int64_t dma_launch_cycles{8};
+  int64_t common_fixed_noise_cycles{16};
   int64_t dma_bytes_per_cycle{32};
-  int64_t matmul_launch_cycles{16};
   int64_t matmul_ops_per_cycle{256};
-  int64_t vector_launch_cycles{6};
   int64_t vector_elems_per_cycle{32};
-  int64_t reshape_launch_cycles{4};
   int64_t reshape_bytes_per_cycle{64};
 };
 
