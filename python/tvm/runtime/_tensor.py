@@ -38,6 +38,10 @@ from tvm.runtime import Device
 from . import _ffi_api
 
 
+# Typhoon is an ext_dev-backed target in phase 1.
+Device._DEVICE_NAME_TO_TYPE["typhoon"] = Device._DEVICE_NAME_TO_TYPE["ext_dev"]
+
+
 def from_dlpack(ext_tensor):
     """
     Convert an external tensor to an Tensor.

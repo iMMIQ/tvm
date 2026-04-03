@@ -325,6 +325,11 @@ TVM_REGISTER_TARGET_KIND("c", kDLCPU)
     .set_default_keys({"cpu"})
     .set_target_canonicalizer(tvm::target::canonicalizer::llvm::Canonicalize);
 
+TVM_REGISTER_TARGET_KIND("typhoon", kDLExtDev)
+    .add_attr_option<int64_t>("sram_size", refl::DefaultValue(1048576))
+    .add_attr_option<int64_t>("num_cores", refl::DefaultValue(1))
+    .set_default_keys({"typhoon", "ext_dev"});
+
 TVM_REGISTER_TARGET_KIND("cuda", kDLCUDA)
     .add_attr_option<ffi::String>("mcpu")
     .add_attr_option<ffi::String>("arch")

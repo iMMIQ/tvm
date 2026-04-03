@@ -103,6 +103,8 @@ class CodeGenCHost : public CodeGenC {
                                    std::ostream& os);  // NOLINT(*)
 };
 
+ffi::Module BuildCHost(IRModule mod, Target target);
+
 }  // namespace codegen
 }  // namespace tvm
 
