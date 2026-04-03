@@ -404,6 +404,17 @@ def PlanTyphoonSRAM():
     return _ffi_api.PlanTyphoonSRAM()  # type: ignore
 
 
+def BuildTyphoonGraph():
+    """Emit Typhoon graph IR from planned ResNet18 and SRAM metadata.
+
+    Returns
+    -------
+    fpass : tvm.transform.Pass
+        The result pass
+    """
+    return _ffi_api.BuildTyphoonGraph()  # type: ignore
+
+
 def LowerTyphoonSubmitGraph():
     """Expand Typhoon submit_graph nodes into GraphBegin + SubmitGraph statements.
 

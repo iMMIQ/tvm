@@ -145,3 +145,4 @@ def test_typhoon_resnet18_accepts_fixed_shape_resnet18_conv_stem():
     assert plan["dtype"] == "float32"
     assert plan["layers"][0]["op_name"] == "stem_conv"
     assert plan["layers"][0]["block_id"] == 0
+    assert plan["layers"][0]["weight_shape"] == [64, 3, 7, 7]

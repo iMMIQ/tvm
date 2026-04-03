@@ -22,11 +22,44 @@ import tvm
 from tvm import tirx
 
 
+def _is_typhoon_primfunc(func):
+    if not isinstance(func, tvm.tirx.PrimFunc):
+        return False
+    attrs = func.attrs
+    if not attrs or "target" not in attrs:
+        return False
+    return attrs["target"].kind.name == "typhoon"
+
+
+def _module_has_typhoon_graph_ir(mod):
+    for _, func in mod.functions.items():
+        if not _is_typhoon_primfunc(func):
+            continue
+        body_text = str(func.body)
+        if "tirx.typhoon." in body_text or "TVMTyphoon" in body_text:
+            return True
+    return False
+
+
+@tvm.transform.module_pass(opt_level=0, name="tirx.MaybeBuildTyphoonGraph")
+def _maybe_build_typhoon_graph(mod, _ctx):
+    if _module_has_typhoon_graph_ir(mod):
+        return mod
+
+    attrs = mod.attrs or {}
+    if "typhoon_resnet18_plan" not in attrs:
+        mod = tirx.transform.IdentifyTyphoonResNet18()(mod)
+    if "typhoon_sram_plan" not in attrs:
+        mod = tirx.transform.PlanTyphoonSRAM()(mod)
+    return tirx.transform.BuildTyphoonGraph()(mod)
+
+
 def finalize_host_passes():  # pylint: disable=unused-argument
     """The default finalization passes for TIR backend."""
     host_pass_list = [
         tirx.transform.LowerTVMBuiltin(),
         tirx.transform.LowerCustomDatatypes(),
+        _maybe_build_typhoon_graph,
         tirx.transform.VerifyTyphoonGraph(),
         tirx.transform.LowerTyphoonTaskDeps(),
         tirx.transform.LowerTyphoonSubmitGraph(),

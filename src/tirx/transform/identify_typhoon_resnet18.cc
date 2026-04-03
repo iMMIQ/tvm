@@ -28,6 +28,7 @@
 #include <tvm/tirx/buffer.h>
 #include <tvm/tirx/expr.h>
 #include <tvm/tirx/function.h>
+#include <tvm/tirx/op.h>
 #include <tvm/tirx/stmt.h>
 #include <tvm/tirx/stmt_functor.h>
 #include <tvm/tirx/transform.h>
@@ -41,6 +42,33 @@ namespace tvm {
 namespace tirx {
 
 namespace {
+
+class ExistingTyphoonGraphDetector : public StmtExprVisitor {
+ public:
+  bool found_graph_ops() const { return found_graph_ops_; }
+
+ private:
+  using Parent = StmtExprVisitor;
+
+  void VisitExpr_(const CallNode* op) final {
+    if (op->op.same_as(region_decl_op_) || op->op.same_as(task_dma_op_) ||
+        op->op.same_as(task_matmul_op_) || op->op.same_as(task_vector_op_) ||
+        op->op.same_as(task_reshape_op_) || op->op.same_as(submit_graph_op_) ||
+        op->op.same_as(wait_graph_op_)) {
+      found_graph_ops_ = true;
+    }
+    Parent::VisitExpr_(op);
+  }
+
+  bool found_graph_ops_{false};
+  const Op& region_decl_op_ = Op::Get("tirx.typhoon.region_decl");
+  const Op& task_dma_op_ = Op::Get("tirx.typhoon.task_dma");
+  const Op& task_matmul_op_ = Op::Get("tirx.typhoon.task_matmul");
+  const Op& task_vector_op_ = Op::Get("tirx.typhoon.task_vector");
+  const Op& task_reshape_op_ = Op::Get("tirx.typhoon.task_reshape");
+  const Op& submit_graph_op_ = Op::Get("tirx.typhoon.submit_graph");
+  const Op& wait_graph_op_ = Op::Get("tirx.typhoon.wait_graph");
+};
 
 std::vector<int64_t> ExpectConstantShape(const Buffer& buffer, const char* name) {
   std::vector<int64_t> shape;
@@ -181,6 +209,7 @@ ffi::String BuildResNet18PlanJSON() {
      << "\"op_name\":\"stem_conv\","
      << "\"logical_input_shape\":[1,3,224,224],"
      << "\"logical_output_shape\":[1,64,112,112],"
+     << "\"weight_shape\":[64,3,7,7],"
      << "\"requires_im2col\":true,"
      << "\"preferred_output_layout\":\"zZ\""
      << "}]"
@@ -214,6 +243,12 @@ Pass IdentifyTyphoonResNet18() {
 
     TVM_FFI_CHECK_EQ(typhoon_funcs.size(), 1U, ValueError)
         << "IdentifyTyphoonResNet18 currently requires a single typhoon PrimFunc";
+
+    ExistingTyphoonGraphDetector detector;
+    detector(typhoon_funcs.front()->body);
+    if (detector.found_graph_ops()) {
+      return mod;
+    }
 
     if (IsFixedShapeResNet18Stem(typhoon_funcs.front())) {
       return WithAttr(std::move(mod), "typhoon_resnet18_plan", BuildResNet18PlanJSON());
