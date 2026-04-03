@@ -24,6 +24,10 @@ This design closes that gap for one tightly scoped case:
 - datatype: `float32`
 - layout: `NCHW`
 
+The hardware SRAM capacity remains the same fixed assumption used by the stage-1 backend:
+
+- `1MB` shared SRAM per core
+
 ## Goal
 
 Compile the fixed-shape ResNet18 model into Typhoon task-DAG IR that:
@@ -158,6 +162,7 @@ For each supported convolution block:
 3. `im2col` is emitted as `task_reshape`
 4. in this stage, `task_reshape` is explicitly extended to cover shape-unit-native transforms that
    may duplicate data, including `im2col`
+5. this extension is encoded by expanding reshape transform metadata, not by adding a new task kind
 4. the left matrix is arranged as `zZ`
 5. weights are brought into SRAM via `task_dma`
 6. weights are arranged as `nN`
@@ -204,6 +209,12 @@ natively in hardware.
 
 This stage extends the vector op-code set with the exact pooling operations needed for fixed-shape
 ResNet18. It does not define a generic pooling framework beyond these exact cases.
+
+For planning purposes, this means:
+
+- `task_vector` payload is extended with the exact parameters needed for the supported pooling ops
+- `task_reshape` payload is extended with the exact parameters needed for `im2col`
+- the task ABI shape remains the same at a high level: existing task kinds are reused
 
 ### Flatten / Reshape
 
@@ -309,6 +320,8 @@ Emit the existing Typhoon task-DAG IR:
 
 This pass must run before the existing Typhoon lowering chain:
 
+- after generic model lowering has produced the canonical TIR patterns to be recognized
+- before `VerifyTyphoonGraph`
 - `VerifyTyphoonGraph`
 - `LowerTyphoonTaskDeps`
 - `LowerTyphoonSubmitGraph`
@@ -325,10 +338,23 @@ Recommended high-level split:
 
 The design intentionally keeps:
 
-- runtime ABI and scheduler unchanged
-- codegen shape unchanged except for consuming the already-existing Typhoon IR
+- the overall runtime ABI shape unchanged
+- the scheduler resource model unchanged
+- the existing task kind set unchanged
 
-This isolates new work to automatic mapping logic rather than disturbing the existing simulator.
+This stage explicitly does allow targeted Typhoon runtime-stack changes where the reused task kinds
+gain richer payload semantics:
+
+- Typhoon op/IR metadata for `task_reshape(im2col)` and `task_vector(pool)`
+- `VerifyTyphoonGraph` validation for those payloads
+- runtime execution semantics for those payloads
+- cost-model accounting and trace reporting for those payloads
+
+Codegen remains structurally the same because it still lowers to the existing `TVMTyphoon*`
+entrypoints. What changes is the metadata carried by the reused task kinds.
+
+This means the bulk of new work is still in automatic mapping logic, but the Typhoon validation and
+runtime layers are also in scope where required to support the richer reshape/vector semantics.
 
 ## Error Handling
 
