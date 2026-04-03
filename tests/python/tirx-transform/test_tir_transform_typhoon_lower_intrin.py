@@ -69,7 +69,10 @@ def test_lower_typhoon_task_matmul_materializes_dep_array():
 
 def test_finalize_host_passes_lower_typhoon_runtime_abi():
     stmt = tvm.tirx.stmt_seq(
-        tvm.tirx.typhoon.task_matmul(7, 1, 0, 1, 2, 64, 64, 64, 1, 0, [4, 9]),
+        tvm.tirx.typhoon.region_decl(7, 0, 0, 4096, 64, 1, "A"),
+        tvm.tirx.typhoon.region_decl(7, 1, 4096, 4096, 64, 1, "B"),
+        tvm.tirx.typhoon.region_decl(7, 2, 8192, 4096, 64, 0, "C"),
+        tvm.tirx.typhoon.task_matmul(7, 1, 0, 1, 2, 64, 64, 64, 1, 0, []),
         tvm.tirx.typhoon.submit_graph(7),
     )
     func = tvm.tirx.PrimFunc([], stmt).with_attr("target", tvm.target.Target({"kind": "typhoon"}))
@@ -77,6 +80,5 @@ def test_finalize_host_passes_lower_typhoon_runtime_abi():
     lowered = tvm.tirx.pipeline.finalize_host_passes()(mod)["main"].body
     lowered_text = str(lowered)
     assert "TVMTyphoonAddMatmulTask" in lowered_text
-    assert "tirx.tvm_stack_alloca" in lowered_text
     assert "TVMTyphoonGraphBegin" in lowered_text
     assert "TVMTyphoonSubmitGraph" in lowered_text

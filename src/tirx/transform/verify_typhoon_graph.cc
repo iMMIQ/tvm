@@ -84,6 +84,10 @@ class TyphoonGraphVerifier : public StmtExprVisitor {
 
     if (call->op.same_as(region_decl_op_)) {
       CollectRegion(call);
+    } else if (call->op.same_as(submit_graph_op_)) {
+      CollectGraphOp(call, "submit_graph");
+    } else if (call->op.same_as(wait_graph_op_)) {
+      CollectGraphOp(call, "wait_graph");
     } else if (call->op.same_as(task_dma_op_)) {
       CollectDMATask(call);
     } else if (call->op.same_as(task_matmul_op_)) {
@@ -123,10 +127,30 @@ class TyphoonGraphVerifier : public StmtExprVisitor {
     return deps;
   }
 
+  int64_t RequireGraphId(const PrimExpr& expr, const char* op_name) {
+    int64_t graph_id = ExpectInt(expr, "graph_id");
+    if (!graph_id_seen_) {
+      graph_id_ = graph_id;
+      graph_id_seen_ = true;
+      return graph_id;
+    }
+    TVM_FFI_CHECK_EQ(graph_id_, graph_id, ValueError)
+        << "Typhoon PrimFunc must use a single graph_id, but " << op_name << " uses "
+        << graph_id << " after graph_id " << graph_id_;
+    return graph_id;
+  }
+
+  void CollectGraphOp(const CallNode* call, const char* op_name) {
+    TVM_FFI_CHECK_EQ(call->args.size(), 1U, ValueError)
+        << "tirx.typhoon." << op_name << " expects graph_id only";
+    RequireGraphId(call->args[0], op_name);
+  }
+
   void CollectRegion(const CallNode* call) {
     TVM_FFI_CHECK_EQ(call->args.size(), 7U, ValueError)
         << "tirx.typhoon.region_decl expects 7 arguments";
 
+    RequireGraphId(call->args[0], "region_decl");
     int64_t region_id = ExpectInt(call->args[1], "region_id");
     int64_t offset = ExpectInt(call->args[2], "offset");
     int64_t size = ExpectInt(call->args[3], "size");
@@ -159,6 +183,7 @@ class TyphoonGraphVerifier : public StmtExprVisitor {
         << "tirx.typhoon.task_dma expects dependency metadata";
 
     TyphoonTaskInfo task;
+    RequireGraphId(call->args[0], "task_dma");
     task.task_id = ExpectInt(call->args[1], "task_id");
     task.kind = "dma";
     task.deps = ParseDeps(call, /*num_deps_index=*/7, task.kind);
@@ -184,7 +209,18 @@ class TyphoonGraphVerifier : public StmtExprVisitor {
   void CollectTask(const CallNode* call, const char* kind, int num_deps_index,
                    std::initializer_list<int> read_arg_indices,
                    std::initializer_list<int> write_arg_indices) {
+    int max_arg_index = num_deps_index;
+    for (int index : read_arg_indices) {
+      max_arg_index = std::max(max_arg_index, index);
+    }
+    for (int index : write_arg_indices) {
+      max_arg_index = std::max(max_arg_index, index);
+    }
+    TVM_FFI_CHECK_GT(static_cast<int>(call->args.size()), max_arg_index, ValueError)
+        << "tirx.typhoon.task_" << kind << " is missing required operands";
+
     TyphoonTaskInfo task;
+    RequireGraphId(call->args[0], kind);
     task.task_id = ExpectInt(call->args[1], "task_id");
     task.kind = kind;
     task.deps = ParseDeps(call, num_deps_index, task.kind);
@@ -347,10 +383,15 @@ class TyphoonGraphVerifier : public StmtExprVisitor {
   std::vector<bool> ancestor_built_;
 
   const Op& region_decl_op_ = Op::Get("tirx.typhoon.region_decl");
+  const Op& submit_graph_op_ = Op::Get("tirx.typhoon.submit_graph");
   const Op& task_dma_op_ = Op::Get("tirx.typhoon.task_dma");
   const Op& task_matmul_op_ = Op::Get("tirx.typhoon.task_matmul");
   const Op& task_vector_op_ = Op::Get("tirx.typhoon.task_vector");
   const Op& task_reshape_op_ = Op::Get("tirx.typhoon.task_reshape");
+  const Op& wait_graph_op_ = Op::Get("tirx.typhoon.wait_graph");
+
+  bool graph_id_seen_{false};
+  int64_t graph_id_{-1};
 };
 
 }  // namespace

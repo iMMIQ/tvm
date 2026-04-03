@@ -58,6 +58,18 @@ def test_verify_typhoon_graph_rejects_duplicate_region_ids():
         _verify(mod)
 
 
+def test_verify_typhoon_graph_rejects_misaligned_regions():
+    mod = _make_mod(tvm.tirx.typhoon.region_decl(GRAPH_ID, 0, 32, 256, 64, 1, "input"))
+    with pytest.raises(ValueError, match="alignment"):
+        _verify(mod)
+
+
+def test_verify_typhoon_graph_rejects_regions_out_of_sram_bounds():
+    mod = _make_mod(tvm.tirx.typhoon.region_decl(GRAPH_ID, 0, 1048448, 512, 64, 1, "input"))
+    with pytest.raises(ValueError, match="bounds"):
+        _verify(mod)
+
+
 def test_verify_typhoon_graph_rejects_duplicate_task_ids():
     mod = _make_mod(
         tvm.tirx.typhoon.region_decl(GRAPH_ID, 0, 0, 256, 64, 1, "input"),
@@ -70,6 +82,16 @@ def test_verify_typhoon_graph_rejects_duplicate_task_ids():
         _verify(mod)
 
 
+def test_verify_typhoon_graph_rejects_mixed_graph_ids():
+    mod = _make_mod(
+        tvm.tirx.typhoon.region_decl(GRAPH_ID, 0, 0, 256, 64, 1, "input"),
+        tvm.tirx.typhoon.region_decl(GRAPH_ID, 1, 256, 256, 64, 0, "output"),
+        tvm.tirx.typhoon.task_reshape(GRAPH_ID + 1, 1, 0, 1, 64, 0, []),
+    )
+    with pytest.raises(ValueError, match="graph_id"):
+        _verify(mod)
+
+
 def test_verify_typhoon_graph_rejects_unknown_dependency():
     mod = _make_mod(
         tvm.tirx.typhoon.region_decl(GRAPH_ID, 0, 0, 256, 64, 1, "input"),
@@ -77,6 +99,15 @@ def test_verify_typhoon_graph_rejects_unknown_dependency():
         tvm.tirx.typhoon.task_reshape(GRAPH_ID, 1, 0, 1, 64, 0, [99]),
     )
     with pytest.raises(ValueError, match="dependency"):
+        _verify(mod)
+
+
+def test_verify_typhoon_graph_rejects_unknown_region_reference():
+    mod = _make_mod(
+        tvm.tirx.typhoon.region_decl(GRAPH_ID, 1, 256, 256, 64, 0, "output"),
+        tvm.tirx.typhoon.task_reshape(GRAPH_ID, 1, 0, 1, 64, 0, []),
+    )
+    with pytest.raises(ValueError, match="unknown input region_id"):
         _verify(mod)
 
 
@@ -98,6 +129,16 @@ def test_verify_typhoon_graph_rejects_compute_operands_that_are_not_region_ids()
         tvm.tirx.typhoon.task_reshape(GRAPH_ID, 1, _global_handle(), 1, 64, 0, []),
     )
     with pytest.raises(ValueError, match="region_id"):
+        _verify(mod)
+
+
+def test_verify_typhoon_graph_rejects_malformed_task_arity():
+    mod = _make_mod(
+        tvm.tirx.Evaluate(
+            tvm.tirx.call_intrin("int32", "tirx.typhoon.task_reshape", GRAPH_ID, 1, 0, 1)
+        )
+    )
+    with pytest.raises(ValueError, match="missing required operands"):
         _verify(mod)
 
 
