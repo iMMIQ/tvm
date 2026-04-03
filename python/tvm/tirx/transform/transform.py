@@ -371,6 +371,17 @@ def LowerTVMBuiltin():
     return _ffi_api.LowerTVMBuiltin()  # type: ignore
 
 
+def VerifyTyphoonGraph():
+    """Verify Typhoon graph structure before intrinsic lowering.
+
+    Returns
+    -------
+    fpass : tvm.transform.Pass
+        The result pass
+    """
+    return _ffi_api.VerifyTyphoonGraph()  # type: ignore
+
+
 def LowerTyphoonSubmitGraph():
     """Expand Typhoon submit_graph nodes into GraphBegin + SubmitGraph statements.
 

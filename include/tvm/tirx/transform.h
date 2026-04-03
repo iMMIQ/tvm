@@ -226,6 +226,13 @@ static constexpr const char* kDisableLowerTVMBuiltin = "disable_lower_builtin";
 TVM_DLL Pass LowerTVMBuiltin();
 
 /*!
+ * \brief Verify Typhoon graph structure before intrinsic lowering.
+ *
+ * \return The pass.
+ */
+TVM_DLL Pass VerifyTyphoonGraph();
+
+/*!
  * \brief Expand Typhoon submit_graph nodes into an explicit graph-begin statement
  *        followed by the original submit_graph node.
  *
