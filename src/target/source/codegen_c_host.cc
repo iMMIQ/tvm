@@ -295,6 +295,8 @@ void CodeGenCHost::VisitExpr_(const CallNode* op, std::ostream& os) {  // NOLINT
     size_t size = 0;
     if (type == "shape") {
       size = (num->value * sizeof(ffi::Shape::index_type) + unit - 1) / unit;
+    } else if (type == "int32") {
+      size = (num->value * sizeof(int32_t) + unit - 1) / unit;
     } else if (type == "tvm_ffi_any") {
       size = (num->value * sizeof(TVMFFIAny) + unit - 1) / unit;
     } else if (type == "array") {

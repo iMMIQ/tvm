@@ -202,7 +202,9 @@ def build(
     # Step 2: Determine the host target
     target_host = "llvm" if tvm.runtime.enabled("llvm") else "c"
     if target is not None:
-        if target.host is not None:
+        if target.kind.name == "typhoon":
+            target_host = target
+        elif target.host is not None:
             target_host = target.host
         elif (
             tvm.device(target.kind.name, 0).dlpack_device_type() == tvm.cpu(0).dlpack_device_type()
@@ -225,7 +227,10 @@ def build(
     mod = pipeline(mod)
 
     # Step 5: Get host and device modules
-    host_mod, device_mod_dict = split_host_device_mods(mod)
+    if target is not None and target.kind.name == "typhoon":
+        host_mod, device_mod_dict = mod, {}
+    else:
+        host_mod, device_mod_dict = split_host_device_mods(mod)
 
     # Step 6: Apply finalization passes
     host_mod = tvm.tirx.pipeline.finalize_host_passes()(host_mod)

@@ -208,6 +208,9 @@ PrimFunc MakePackedAPI(PrimFunc func) {
     return opt.value();
   }();
   int target_device_type = target->GetTargetDeviceType();
+  if (target->kind->name == "typhoon") {
+    target_device_type = static_cast<int>(kDLCPU);
+  }
 
   // A function without a host target has already been lowered.
   Target target_host;
