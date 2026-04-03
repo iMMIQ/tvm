@@ -155,7 +155,9 @@ For each supported convolution block:
 
 1. input activation is brought into SRAM via `task_dma`
 2. convolution input is transformed into an `im2col` matrix
-3. if `im2col` requires physical data reorder, emit `task_reshape`
+3. `im2col` is emitted as `task_reshape`
+4. in this stage, `task_reshape` is explicitly extended to cover shape-unit-native transforms that
+   may duplicate data, including `im2col`
 4. the left matrix is arranged as `zZ`
 5. weights are brought into SRAM via `task_dma`
 6. weights are arranged as `nN`
@@ -197,8 +199,11 @@ Only the specific pooling patterns required by fixed-shape ResNet18 are supporte
 - initial `maxpool2d(kernel=3x3, stride=2, padding=1)`
 - final global average pool over the final spatial extent
 
-These are lowered through a restricted ResNet18-specific expansion using existing Typhoon task
-kinds. This stage does not define a generic pooling framework beyond these exact cases.
+These are lowered as `task_vector` operations because the vector unit is assumed to support pooling
+natively in hardware.
+
+This stage extends the vector op-code set with the exact pooling operations needed for fixed-shape
+ResNet18. It does not define a generic pooling framework beyond these exact cases.
 
 ### Flatten / Reshape
 
@@ -351,6 +356,8 @@ Testing should be layered.
 - ResNet18 pattern recognition for supported canonical subgraphs
 - SRAM region planning and reuse
 - task-DAG emission for key layer types
+- `im2col` lowering through `task_reshape`
+- fixed ResNet18 pool lowering through `task_vector`
 
 ### Integration Tests
 
