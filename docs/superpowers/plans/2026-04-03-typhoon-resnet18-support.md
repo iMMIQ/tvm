@@ -31,6 +31,52 @@ can be implemented and tested independently.
 Use one concrete serialized format consistently across these passes, such as JSON carried in a
 module attribute. Do not invent a different schema in each task.
 
+Minimum required schema examples:
+
+```json
+{
+  "typhoon_resnet18_plan": {
+    "model": "resnet18",
+    "input_shape": [1, 3, 224, 224],
+    "dtype": "float32",
+    "layers": [
+      {
+        "layer_id": 0,
+        "kind": "conv2d",
+        "op_name": "stem_conv",
+        "logical_input_shape": [1, 3, 224, 224],
+        "logical_output_shape": [1, 64, 112, 112],
+        "requires_im2col": true,
+        "preferred_output_layout": "zZ"
+      }
+    ]
+  }
+}
+```
+
+```json
+{
+  "typhoon_sram_plan": {
+    "tile": {"Mt": 64, "Nt": 64, "Kt": 64, "m0": 8, "n0": 8, "k0": 8},
+    "regions": [
+      {"region_id": 0, "name": "act0", "offset": 0, "size": 131072, "alignment": 64},
+      {"region_id": 1, "name": "act1", "offset": 131072, "size": 131072, "alignment": 64}
+    ],
+    "layer_tiles": [
+      {
+        "layer_id": 0,
+        "tile_id": 0,
+        "reads": ["act0", "wgt0"],
+        "writes": ["col0", "aux0"]
+      }
+    ]
+  }
+}
+```
+
+An implementation may add fields, but these fields must exist so downstream passes and tests have a
+stable contract.
+
 ## File Structure
 
 ### Existing Files To Modify
@@ -87,6 +133,26 @@ module attribute. Do not invent a different schema in each task.
   Add compile-time validation coverage for the richer reshape/vector payloads.
 - Modify: `tests/python/codegen/test_target_codegen_typhoon.py`
   Add focused coverage for tile-size-sensitive latency and extended reshape/vector lowering semantics.
+
+## Task Layout Rules
+
+Use these deterministic physical-layout rules while implementing Task 3 and Task 4.
+
+- `task_dma`
+  - may move data between GM logical layout and any explicitly named SRAM physical layout
+- `task_matmul`
+  - left input must read `zZ`
+  - right input must read `nN`
+  - output may write `zZ` or `nN`
+- `task_vector(add/relu/bias/pool)`
+  - stage-2 vector tasks only operate on ordinary contiguous logical layout in SRAM
+  - they do not directly consume matmul-specific fractal layouts in this stage
+  - therefore `task_reshape` must be inserted before/after vector work whenever the source or sink
+    is in `zZ` or `nN`
+- `task_reshape`
+  - may convert logical layout <-> fractal layout
+  - may convert `zZ` <-> `nN` where supported by the design
+  - carries `im2col` materialization semantics when requested by transform metadata
 
 ## Task 1: Add Fixed-Shape ResNet18 Scope Gate And Pattern Recognition
 
