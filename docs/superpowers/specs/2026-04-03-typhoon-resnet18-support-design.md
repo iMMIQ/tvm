@@ -99,20 +99,46 @@ The hardware matrix unit has fixed layout requirements:
 This design treats these as physical SRAM layouts for matrix-unit consumption, not as generic
 logical tensor layouts visible to the model frontend.
 
-### Fractal Conversion Rule
+### Dtype-Dependent Tile Shape
 
-For a logical matrix `A[M, K]`, with matrix-unit tile shape `m0 x k0`:
+The matrix-unit fractal tile shape depends on datatype.
+
+For this stage:
+
+- only `float32` is supported
+- `float32` uses `m0 = n0 = k0 = 8`
+
+Future datatypes may use different fractal sizes. This stage does not define layout rules for
+other dtypes beyond reserving that extension point.
+
+### Fractal Layout Definitions
+
+For a logical left-hand matrix `A[M, K]`:
 
 - `M1 = ceil_div(M, m0)`
 - `K1 = ceil_div(K, k0)`
+- `zZ` is represented as `[M1, K1, m0, k0]`
+- logical access shape is `src[m1, k1, mi, ki]`
 
-The physical fractal forms are interpreted as:
+For a logical right-hand matrix `B[K, N]`:
 
-- `zZ`: `[M1, K1, m0, k0]`
-- `nZ`: `[K1, M1, m0, k0]`
+- `K1 = ceil_div(K, k0)`
+- `N1 = ceil_div(N, n0)`
+- `nN` is represented as `[K1, N1, k0, n0]`
+- logical access shape is `src[k1, n1, ki, ni]`
 
-Converting `nZ -> zZ` is therefore not a block-internal transpose. It is a reorder of the outer
-fractal grid:
+The output layout may be either:
+
+- `zZ`: `[M1, N1, m0, n0]`
+- `nN`: `[N1, M1, n0, m0]`
+
+The planner must choose the output layout explicitly and emit a real `task_reshape` whenever a
+physical reorder is required.
+
+### Fractal Conversion Rule
+
+For left-hand matrix preparation, converting `nZ -> zZ` is not a block-internal transpose. It is a
+reorder of the outer fractal grid:
 
 - `src[k1, m1, mi, ki] -> dst[m1, k1, mi, ki]`
 
@@ -166,9 +192,13 @@ Lower as `task_vector(op=relu)`
 
 No new pool unit is introduced in this stage.
 
-Only the specific pooling patterns required by ResNet18 are supported. They may be lowered using a
-restricted combination of `task_reshape` and `task_vector`, or a similarly constrained expansion,
-as long as the resulting graph stays within the existing Typhoon task kinds.
+Only the specific pooling patterns required by fixed-shape ResNet18 are supported:
+
+- initial `maxpool2d(kernel=3x3, stride=2, padding=1)`
+- final global average pool over the final spatial extent
+
+These are lowered through a restricted ResNet18-specific expansion using existing Typhoon task
+kinds. This stage does not define a generic pooling framework beyond these exact cases.
 
 ### Flatten / Reshape
 
@@ -301,7 +331,7 @@ Compilation should fail clearly when:
 
 - the model is not recognized as the supported ResNet18 structure
 - a required operator pattern is unsupported
-- SRAM planning exceeds 1MB capacity for a required block/tile choice
+- SRAM planning exceeds 1MB capacity for the required `float32` block/tile choice
 - a required layout conversion cannot be represented within the existing task kinds
 
 Errors should identify:
@@ -329,18 +359,25 @@ Testing should be layered.
 - generated C code contains Typhoon runtime ABI calls
 - VM executable exports successfully
 
+The development entry path is:
+
+- default model path: `~/model/resnet18.onnx`
+- automated tests may override this through an environment variable so the path is reproducible
+
 ### Runtime Tests
 
 - ResNet18 task graph runs through the existing simulator
 - scheduler produces deterministic traces
 - traces show overlap where dependencies and resources allow it
-- numerical output is correct for the fixed-shape model within expected float32 tolerance
+- numerical output is correct for the fixed-shape model within `float32` tolerance of
+  `rtol=1e-4, atol=1e-4`
 
 ## Success Criteria
 
 This stage is complete only when all of the following are true:
 
-- `~/model/resnet18.onnx` with input `1 x 3 x 224 x 224` compiles successfully to Typhoon
+- the configured ResNet18 ONNX path, defaulting to `~/model/resnet18.onnx`, with input
+  `1 x 3 x 224 x 224` compiles successfully to Typhoon
 - the emitted Typhoon-side C source contains `TVMTyphoon*` graph/runtime ABI calls
 - the compiled model is represented as Typhoon task-DAG IR, not only as generic Relax/VM code
 - `conv2d` is lowered through `im2col + matmul`
