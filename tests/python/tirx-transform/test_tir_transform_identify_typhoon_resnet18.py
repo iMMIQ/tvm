@@ -21,27 +21,67 @@ import pytest
 import tvm
 
 
-def _make_body(input_buffer, output_buffer, body_kind):
+def _make_body(input_buffer, weight_buffer, output_buffer, body_kind):
     if body_kind == "stem":
-        return tvm.tirx.BufferStore(
-            output_buffer, tvm.tirx.BufferLoad(input_buffer, [0, 0, 0, 0]), [0, 0, 0, 0]
+        oc = tvm.tirx.Var("oc", "int32")
+        oh = tvm.tirx.Var("oh", "int32")
+        ow = tvm.tirx.Var("ow", "int32")
+        store = tvm.tirx.BufferStore(
+            output_buffer,
+            tvm.tirx.BufferLoad(input_buffer, [0, 0, oh * 2, ow * 2])
+            + tvm.tirx.BufferLoad(weight_buffer, [oc, 0, 0, 0]),
+            [0, oc, oh, ow],
+        )
+        return tvm.tirx.For(
+            oc,
+            tvm.tirx.const(0, "int32"),
+            tvm.tirx.const(64, "int32"),
+            tvm.tirx.ForKind.SERIAL,
+            tvm.tirx.For(
+                oh,
+                tvm.tirx.const(0, "int32"),
+                tvm.tirx.const(112, "int32"),
+                tvm.tirx.ForKind.SERIAL,
+                tvm.tirx.For(
+                    ow,
+                    tvm.tirx.const(0, "int32"),
+                    tvm.tirx.const(112, "int32"),
+                    tvm.tirx.ForKind.SERIAL,
+                    store,
+                ),
+            ),
         )
     if body_kind == "trivial":
         return tvm.tirx.Evaluate(0)
     raise ValueError(f"Unsupported body_kind: {body_kind}")
 
 
-def _make_func(input_shape, output_shape, target_kind="typhoon", body_kind="stem"):
+def _make_func(
+    input_shape,
+    output_shape,
+    weight_shape=(64, 3, 7, 7),
+    target_kind="typhoon",
+    body_kind="stem",
+):
     input_buffer = tvm.tirx.decl_buffer(input_shape, "float32", name="input")
+    weight_buffer = tvm.tirx.decl_buffer(weight_shape, "float32", name="weight")
     output_buffer = tvm.tirx.decl_buffer(output_shape, "float32", name="output")
-    body = _make_body(input_buffer, output_buffer, body_kind)
-    return tvm.tirx.PrimFunc([input_buffer, output_buffer], body).with_attr(
+    body = _make_body(input_buffer, weight_buffer, output_buffer, body_kind)
+    return tvm.tirx.PrimFunc([input_buffer, weight_buffer, output_buffer], body).with_attr(
         "target", tvm.target.Target({"kind": target_kind})
     )
 
 
-def _make_mod(input_shape, output_shape, target_kind="typhoon", body_kind="stem"):
-    return tvm.IRModule.from_expr(_make_func(input_shape, output_shape, target_kind, body_kind))
+def _make_mod(
+    input_shape,
+    output_shape,
+    weight_shape=(64, 3, 7, 7),
+    target_kind="typhoon",
+    body_kind="stem",
+):
+    return tvm.IRModule.from_expr(
+        _make_func(input_shape, output_shape, weight_shape, target_kind, body_kind)
+    )
 
 
 def build_non_resnet18_tir_module():

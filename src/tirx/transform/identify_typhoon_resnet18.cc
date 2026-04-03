@@ -33,6 +33,7 @@
 #include <tvm/tirx/transform.h>
 
 #include <sstream>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -66,53 +67,96 @@ bool IsShape(const std::vector<int64_t>& actual, std::initializer_list<int64_t> 
   return true;
 }
 
-class StemPatternVerifier : public StmtExprVisitor {
+class LoadSourceVerifier : public ExprVisitor {
  public:
-  StemPatternVerifier(Buffer input, Buffer output) : input_(std::move(input)), output_(std::move(output)) {}
+  LoadSourceVerifier(Buffer input, Buffer weight)
+      : input_(std::move(input)), weight_(std::move(weight)) {}
 
-  bool matched() const { return matched_; }
+  bool saw_input() const { return saw_input_; }
+  bool saw_weight() const { return saw_weight_; }
 
  private:
+  void VisitExpr_(const BufferLoadNode* op) final {
+    if (op->buffer.same_as(input_)) {
+      saw_input_ = true;
+    }
+    if (op->buffer.same_as(weight_)) {
+      saw_weight_ = true;
+    }
+    ExprVisitor::VisitExpr_(op);
+  }
+
+  Buffer input_;
+  Buffer weight_;
+  bool saw_input_{false};
+  bool saw_weight_{false};
+};
+
+class StemPatternVerifier : public StmtExprVisitor {
+ public:
+  StemPatternVerifier(Buffer input, Buffer weight, Buffer output)
+      : input_(std::move(input)), weight_(std::move(weight)), output_(std::move(output)) {}
+
+  bool matched() const {
+    return matched_store_ && loop_extents_.count(64) >= 1 && loop_extents_.count(112) >= 2;
+  }
+
+ private:
+  void VisitStmt_(const ForNode* op) final {
+    if (const auto* imm = op->extent.as<IntImmNode>()) {
+      loop_extents_.insert(imm->value);
+    }
+    StmtExprVisitor::VisitStmt_(op);
+  }
+
   void VisitStmt_(const BufferStoreNode* op) final {
     if (op->buffer.same_as(output_)) {
-      if (const auto* load = op->value.as<BufferLoadNode>()) {
-        if (load->buffer.same_as(input_)) {
-          matched_ = true;
-        }
+      LoadSourceVerifier verifier(input_, weight_);
+      verifier(op->value);
+      if (verifier.saw_input() && verifier.saw_weight()) {
+        matched_store_ = true;
       }
     }
     StmtExprVisitor::VisitStmt_(op);
   }
 
   Buffer input_;
+  Buffer weight_;
   Buffer output_;
-  bool matched_{false};
+  bool matched_store_{false};
+  std::multiset<int64_t> loop_extents_;
 };
 
 bool IsFixedShapeResNet18Stem(const PrimFunc& func) {
-  if (func->params.size() != 2 || func->buffer_map.size() != 2) {
+  Buffer input;
+  Buffer weight;
+  Buffer output;
+  for (const auto& [param, buffer] : func->buffer_map) {
+    if (buffer->dtype != DataType::Float(32)) {
+      continue;
+    }
+
+    std::vector<int64_t> shape = ExpectConstantShape(buffer, "candidate");
+    if (IsShape(shape, {1, 3, 224, 224})) {
+      TVM_FFI_CHECK(!input.defined(), ValueError)
+          << "IdentifyTyphoonResNet18 found multiple input-shaped buffers";
+      input = buffer;
+    } else if (IsShape(shape, {64, 3, 7, 7})) {
+      TVM_FFI_CHECK(!weight.defined(), ValueError)
+          << "IdentifyTyphoonResNet18 found multiple weight-shaped buffers";
+      weight = buffer;
+    } else if (IsShape(shape, {1, 64, 112, 112})) {
+      TVM_FFI_CHECK(!output.defined(), ValueError)
+          << "IdentifyTyphoonResNet18 found multiple output-shaped buffers";
+      output = buffer;
+    }
+  }
+
+  if (!input.defined() || !weight.defined() || !output.defined()) {
     return false;
   }
 
-  auto input_it = func->buffer_map.find(func->params[0]);
-  auto output_it = func->buffer_map.find(func->params[1]);
-  if (input_it == func->buffer_map.end() || output_it == func->buffer_map.end()) {
-    return false;
-  }
-
-  const Buffer& input = (*input_it).second;
-  const Buffer& output = (*output_it).second;
-  if (input->dtype != DataType::Float(32) || output->dtype != DataType::Float(32)) {
-    return false;
-  }
-
-  std::vector<int64_t> input_shape = ExpectConstantShape(input, "input");
-  std::vector<int64_t> output_shape = ExpectConstantShape(output, "output");
-  if (!IsShape(input_shape, {1, 3, 224, 224}) || !IsShape(output_shape, {1, 64, 112, 112})) {
-    return false;
-  }
-
-  StemPatternVerifier verifier(input, output);
+  StemPatternVerifier verifier(input, weight, output);
   verifier(func->body);
   return verifier.matched();
 }
