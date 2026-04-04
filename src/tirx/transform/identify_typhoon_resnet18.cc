@@ -33,9 +33,13 @@
 #include <tvm/tirx/stmt_functor.h>
 #include <tvm/tirx/transform.h>
 
+#include <algorithm>
+#include <cctype>
+#include <map>
 #include <sstream>
 #include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace tvm {
@@ -95,6 +99,345 @@ bool IsShape(const std::vector<int64_t>& actual, std::initializer_list<int64_t> 
   return true;
 }
 
+std::string ToLower(std::string value) {
+  std::transform(value.begin(), value.end(), value.begin(),
+                 [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  return value;
+}
+
+bool ContainsExplicitBatchNorm(const std::string& symbol) {
+  std::string normalized = ToLower(symbol);
+  return normalized.find("batch_norm") != std::string::npos ||
+         normalized.find("batchnormalization") != std::string::npos ||
+         normalized.find("batchnorm") != std::string::npos;
+}
+
+std::string GetGlobalSymbol(const GlobalVar& gvar, const PrimFunc& func) {
+  auto global_symbol = func->GetAttr<ffi::String>("global_symbol");
+  if (global_symbol.has_value()) {
+    return global_symbol.value();
+  }
+  return gvar->name_hint;
+}
+
+std::vector<std::vector<int64_t>> GetOrderedBufferShapes(const PrimFunc& func) {
+  std::vector<std::vector<int64_t>> shapes;
+  shapes.reserve(func->params.size());
+  for (const Var& param : func->params) {
+    auto it = func->buffer_map.find(param);
+    TVM_FFI_CHECK(it != func->buffer_map.end(), ValueError)
+        << "IdentifyTyphoonResNet18 requires PrimFunc params to be bound to buffers";
+    const Buffer& buffer = (*it).second;
+    TVM_FFI_CHECK(buffer->dtype == DataType::Float(32), ValueError)
+        << "IdentifyTyphoonResNet18 only supports float32 canonical ResNet18 buffers";
+    shapes.push_back(ExpectConstantShape(buffer, buffer->name.c_str()));
+  }
+  return shapes;
+}
+
+struct NamedPrimFunc {
+  std::string symbol;
+  PrimFunc func;
+};
+
+struct ExpectedFuncSpec {
+  const char* symbol;
+  std::vector<std::vector<int64_t>> buffer_shapes;
+};
+
+const std::vector<ExpectedFuncSpec>& GetCanonicalFunctionSpecs() {
+  static const std::vector<ExpectedFuncSpec> specs = {
+      {"conv2d", {{1, 3, 224, 224}, {64, 3, 7, 7}, {1, 64, 112, 112}}},
+      {"reshape", {{64}, {1, 64, 1, 1}}},
+      {"add", {{1, 64, 112, 112}, {1, 64, 1, 1}, {1, 64, 112, 112}}},
+      {"relu", {{1, 64, 112, 112}, {1, 64, 112, 112}}},
+      {"max_pool2d", {{1, 64, 112, 112}, {1, 64, 56, 56}}},
+      {"conv2d1", {{1, 64, 56, 56}, {64, 64, 3, 3}, {1, 64, 56, 56}}},
+      {"add1", {{1, 64, 56, 56}, {1, 64, 1, 1}, {1, 64, 56, 56}}},
+      {"relu1", {{1, 64, 56, 56}, {1, 64, 56, 56}}},
+      {"add2", {{1, 64, 56, 56}, {1, 64, 56, 56}, {1, 64, 56, 56}}},
+      {"conv2d2", {{1, 64, 56, 56}, {128, 64, 3, 3}, {1, 128, 28, 28}}},
+      {"reshape1", {{128}, {1, 128, 1, 1}}},
+      {"add3", {{1, 128, 28, 28}, {1, 128, 1, 1}, {1, 128, 28, 28}}},
+      {"relu2", {{1, 128, 28, 28}, {1, 128, 28, 28}}},
+      {"conv2d3", {{1, 128, 28, 28}, {128, 128, 3, 3}, {1, 128, 28, 28}}},
+      {"conv2d4", {{1, 64, 56, 56}, {128, 64, 1, 1}, {1, 128, 28, 28}}},
+      {"add4", {{1, 128, 28, 28}, {1, 128, 28, 28}, {1, 128, 28, 28}}},
+      {"conv2d5", {{1, 128, 28, 28}, {256, 128, 3, 3}, {1, 256, 14, 14}}},
+      {"reshape2", {{256}, {1, 256, 1, 1}}},
+      {"add5", {{1, 256, 14, 14}, {1, 256, 1, 1}, {1, 256, 14, 14}}},
+      {"relu3", {{1, 256, 14, 14}, {1, 256, 14, 14}}},
+      {"conv2d6", {{1, 256, 14, 14}, {256, 256, 3, 3}, {1, 256, 14, 14}}},
+      {"conv2d7", {{1, 128, 28, 28}, {256, 128, 1, 1}, {1, 256, 14, 14}}},
+      {"add6", {{1, 256, 14, 14}, {1, 256, 14, 14}, {1, 256, 14, 14}}},
+      {"conv2d8", {{1, 256, 14, 14}, {512, 256, 3, 3}, {1, 512, 7, 7}}},
+      {"reshape3", {{512}, {1, 512, 1, 1}}},
+      {"add7", {{1, 512, 7, 7}, {1, 512, 1, 1}, {1, 512, 7, 7}}},
+      {"relu4", {{1, 512, 7, 7}, {1, 512, 7, 7}}},
+      {"conv2d9", {{1, 512, 7, 7}, {512, 512, 3, 3}, {1, 512, 7, 7}}},
+      {"conv2d10", {{1, 256, 14, 14}, {512, 256, 1, 1}, {1, 512, 7, 7}}},
+      {"add8", {{1, 512, 7, 7}, {1, 512, 7, 7}, {1, 512, 7, 7}}},
+      {"mean", {{1, 512, 7, 7}, {1, 512, 1, 1}}},
+      {"reshape4", {{1, 512, 1, 1}, {1, 512}}},
+      {"transpose", {{1000, 512}, {512, 1000}}},
+      {"matmul", {{1, 512}, {512, 1000}, {1, 1000}}},
+      {"add9", {{1, 1000}, {1000}, {1, 1000}}},
+  };
+  return specs;
+}
+
+bool MatchesExpectedBufferShapes(const PrimFunc& func,
+                                 const std::vector<std::vector<int64_t>>& expected_shapes) {
+  return GetOrderedBufferShapes(func) == expected_shapes;
+}
+
+bool IsCanonicalResNet18FullGraph(const std::vector<NamedPrimFunc>& typhoon_funcs) {
+  const auto& specs = GetCanonicalFunctionSpecs();
+  std::set<std::string> expected_symbols;
+  for (const ExpectedFuncSpec& spec : specs) {
+    expected_symbols.insert(spec.symbol);
+  }
+  std::map<std::string, PrimFunc> funcs_by_symbol;
+  for (const NamedPrimFunc& entry : typhoon_funcs) {
+    if (ContainsExplicitBatchNorm(entry.symbol)) {
+      TVM_FFI_THROW(ValueError)
+          << "IdentifyTyphoonResNet18 does not support explicit BatchNormalization; "
+          << "expected canonical batch-norm-folded ResNet18";
+    }
+    if (!funcs_by_symbol.emplace(entry.symbol, entry.func).second) {
+      TVM_FFI_THROW(ValueError)
+          << "IdentifyTyphoonResNet18 requires unique canonical operator symbols, found duplicate `"
+          << entry.symbol << "`";
+    }
+    TVM_FFI_CHECK(expected_symbols.count(entry.symbol) != 0, ValueError)
+        << "IdentifyTyphoonResNet18 requires the canonical ResNet18 operator family; found `"
+        << entry.symbol << "`";
+  }
+
+  if (funcs_by_symbol.size() != specs.size()) {
+    return false;
+  }
+
+  for (const ExpectedFuncSpec& spec : specs) {
+    auto it = funcs_by_symbol.find(spec.symbol);
+    if (it == funcs_by_symbol.end()) {
+      return false;
+    }
+    if (!MatchesExpectedBufferShapes(it->second, spec.buffer_shapes)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+struct StagePlanSpec {
+  int stage_id;
+  const char* name;
+  std::vector<int> block_ids;
+};
+
+struct BlockPlanSpec {
+  int block_id;
+  int stage_id;
+  std::vector<int> layer_ids;
+};
+
+struct LayerPlanSpec {
+  int layer_id;
+  int stage_id;
+  int block_id;
+  const char* kind;
+  const char* op_name;
+  std::vector<int64_t> logical_input_shape;
+  std::vector<int64_t> logical_output_shape;
+  std::vector<int64_t> weight_shape;
+  bool has_weight_shape{false};
+  bool requires_im2col{false};
+  bool has_layout_transform{false};
+  const char* input_layout{nullptr};
+  const char* output_layout{nullptr};
+};
+
+struct EdgePlanSpec {
+  int src_layer_id;
+  int dst_layer_id;
+  const char* edge_kind;
+};
+
+void AppendIntArray(std::ostringstream& os, const std::vector<int64_t>& values) {
+  os << "[";
+  for (size_t i = 0; i < values.size(); ++i) {
+    if (i != 0) {
+      os << ",";
+    }
+    os << values[i];
+  }
+  os << "]";
+}
+
+void AppendIntArray(std::ostringstream& os, const std::vector<int>& values) {
+  os << "[";
+  for (size_t i = 0; i < values.size(); ++i) {
+    if (i != 0) {
+      os << ",";
+    }
+    os << values[i];
+  }
+  os << "]";
+}
+
+ffi::String BuildResNet18PlanJSON() {
+  static const std::vector<StagePlanSpec> stages = {
+      {0, "stage0", {0}}, {1, "stage1", {1}}, {2, "stage2", {2}}, {3, "stage3", {3}}};
+  static const std::vector<BlockPlanSpec> blocks = {
+      {0, 0, {0, 1, 2, 3, 4, 5, 6, 7}},
+      {1, 1, {8, 9, 10, 11, 12, 13}},
+      {2, 2, {14, 15, 16, 17, 18, 19}},
+      {3, 3, {20, 21, 22, 23, 24, 25, 26, 27, 28}},
+  };
+  static const std::vector<LayerPlanSpec> layers = {
+      {0, 0, 0, "conv2d", "stem_conv", {1, 3, 224, 224}, {1, 64, 112, 112}, {64, 3, 7, 7},
+       true, true, true, "NCHW", "zZ"},
+      {1, 0, 0, "bias_add", "stem_bias_add", {1, 64, 112, 112}, {1, 64, 112, 112}},
+      {2, 0, 0, "relu", "stem_relu", {1, 64, 112, 112}, {1, 64, 112, 112}},
+      {3, 0, 0, "max_pool2d", "stem_max_pool", {1, 64, 112, 112}, {1, 64, 56, 56}},
+      {4, 0, 0, "conv2d", "stage0_conv", {1, 64, 56, 56}, {1, 64, 56, 56}, {64, 64, 3, 3},
+       true, true, true, "NCHW", "zZ"},
+      {5, 0, 0, "bias_add", "stage0_bias_add", {1, 64, 56, 56}, {1, 64, 56, 56}},
+      {6, 0, 0, "relu", "stage0_relu", {1, 64, 56, 56}, {1, 64, 56, 56}},
+      {7, 0, 0, "residual_add", "stage0_residual_add", {1, 64, 56, 56}, {1, 64, 56, 56}},
+      {8, 1, 1, "conv2d", "stage1_conv0", {1, 64, 56, 56}, {1, 128, 28, 28}, {128, 64, 3, 3},
+       true, true, true, "NCHW", "zZ"},
+      {9, 1, 1, "bias_add", "stage1_bias_add", {1, 128, 28, 28}, {1, 128, 28, 28}},
+      {10, 1, 1, "relu", "stage1_relu", {1, 128, 28, 28}, {1, 128, 28, 28}},
+      {11, 1, 1, "conv2d", "stage1_conv1", {1, 128, 28, 28}, {1, 128, 28, 28},
+       {128, 128, 3, 3}, true, true, true, "NCHW", "zZ"},
+      {12, 1, 1, "conv2d", "stage1_skip_conv", {1, 64, 56, 56}, {1, 128, 28, 28},
+       {128, 64, 1, 1}, true, false, true, "NCHW", "zZ"},
+      {13, 1, 1, "residual_add", "stage1_residual_add", {1, 128, 28, 28}, {1, 128, 28, 28}},
+      {14, 2, 2, "conv2d", "stage2_conv0", {1, 128, 28, 28}, {1, 256, 14, 14},
+       {256, 128, 3, 3}, true, true, true, "NCHW", "zZ"},
+      {15, 2, 2, "bias_add", "stage2_bias_add", {1, 256, 14, 14}, {1, 256, 14, 14}},
+      {16, 2, 2, "relu", "stage2_relu", {1, 256, 14, 14}, {1, 256, 14, 14}},
+      {17, 2, 2, "conv2d", "stage2_conv1", {1, 256, 14, 14}, {1, 256, 14, 14},
+       {256, 256, 3, 3}, true, true, true, "NCHW", "zZ"},
+      {18, 2, 2, "conv2d", "stage2_skip_conv", {1, 128, 28, 28}, {1, 256, 14, 14},
+       {256, 128, 1, 1}, true, false, true, "NCHW", "zZ"},
+      {19, 2, 2, "residual_add", "stage2_residual_add", {1, 256, 14, 14}, {1, 256, 14, 14}},
+      {20, 3, 3, "conv2d", "stage3_conv0", {1, 256, 14, 14}, {1, 512, 7, 7},
+       {512, 256, 3, 3}, true, true, true, "NCHW", "zZ"},
+      {21, 3, 3, "bias_add", "stage3_bias_add", {1, 512, 7, 7}, {1, 512, 7, 7}},
+      {22, 3, 3, "relu", "stage3_relu", {1, 512, 7, 7}, {1, 512, 7, 7}},
+      {23, 3, 3, "conv2d", "stage3_conv1", {1, 512, 7, 7}, {1, 512, 7, 7},
+       {512, 512, 3, 3}, true, true, true, "NCHW", "zZ"},
+      {24, 3, 3, "conv2d", "stage3_skip_conv", {1, 256, 14, 14}, {1, 512, 7, 7},
+       {512, 256, 1, 1}, true, false, true, "NCHW", "zZ"},
+      {25, 3, 3, "residual_add", "stage3_residual_add", {1, 512, 7, 7}, {1, 512, 7, 7}},
+      {26, 3, 3, "global_avg_pool", "global_avg_pool", {1, 512, 7, 7}, {1, 512, 1, 1}},
+      {27, 3, 3, "flatten", "flatten", {1, 512, 1, 1}, {1, 512}},
+      {28, 3, 3, "dense", "dense", {1, 512}, {1, 1000}, {1000, 512}, true, false, true, "NC",
+       "zZ"},
+  };
+  static const std::vector<EdgePlanSpec> edges = {
+      {0, 1, "data"},  {1, 2, "data"},     {2, 3, "data"},      {3, 4, "data"},
+      {4, 5, "data"},  {5, 6, "data"},     {6, 7, "data"},      {3, 7, "residual"},
+      {7, 8, "data"},  {8, 9, "data"},     {9, 10, "data"},     {10, 11, "data"},
+      {7, 12, "residual_projection"},      {11, 13, "data"},    {12, 13, "residual"},
+      {13, 14, "data"},                    {14, 15, "data"},    {15, 16, "data"},
+      {16, 17, "data"},                    {13, 18, "residual_projection"},
+      {17, 19, "data"},                    {18, 19, "residual"}, {19, 20, "data"},
+      {20, 21, "data"},                    {21, 22, "data"},    {22, 23, "data"},
+      {19, 24, "residual_projection"},     {23, 25, "data"},    {24, 25, "residual"},
+      {25, 26, "data"},                    {26, 27, "data"},    {27, 28, "data"},
+  };
+
+  std::ostringstream os;
+  os << "{"
+     << "\"model\":\"resnet18\","
+     << "\"recognized_scope\":\"full_graph\","
+     << "\"input_shape\":[1,3,224,224],"
+     << "\"dtype\":\"float32\",";
+
+  os << "\"stages\":[";
+  for (size_t i = 0; i < stages.size(); ++i) {
+    if (i != 0) {
+      os << ",";
+    }
+    const StagePlanSpec& stage = stages[i];
+    os << "{"
+       << "\"stage_id\":" << stage.stage_id << ","
+       << "\"name\":\"" << stage.name << "\","
+       << "\"block_ids\":";
+    AppendIntArray(os, stage.block_ids);
+    os << "}";
+  }
+  os << "],";
+
+  os << "\"blocks\":[";
+  for (size_t i = 0; i < blocks.size(); ++i) {
+    if (i != 0) {
+      os << ",";
+    }
+    const BlockPlanSpec& block = blocks[i];
+    os << "{"
+       << "\"block_id\":" << block.block_id << ","
+       << "\"stage_id\":" << block.stage_id << ","
+       << "\"layer_ids\":";
+    AppendIntArray(os, block.layer_ids);
+    os << "}";
+  }
+  os << "],";
+
+  os << "\"layers\":[";
+  for (size_t i = 0; i < layers.size(); ++i) {
+    if (i != 0) {
+      os << ",";
+    }
+    const LayerPlanSpec& layer = layers[i];
+    os << "{"
+       << "\"layer_id\":" << layer.layer_id << ","
+       << "\"stage_id\":" << layer.stage_id << ","
+       << "\"block_id\":" << layer.block_id << ","
+       << "\"kind\":\"" << layer.kind << "\","
+       << "\"op_name\":\"" << layer.op_name << "\","
+       << "\"logical_input_shape\":";
+    AppendIntArray(os, layer.logical_input_shape);
+    os << ",\"logical_output_shape\":";
+    AppendIntArray(os, layer.logical_output_shape);
+    if (layer.has_weight_shape) {
+      os << ",\"weight_shape\":";
+      AppendIntArray(os, layer.weight_shape);
+    }
+    if (layer.kind == std::string("conv2d")) {
+      os << ",\"requires_im2col\":" << (layer.requires_im2col ? "true" : "false");
+    }
+    if (layer.has_layout_transform) {
+      os << ",\"layout_transform\":{"
+         << "\"input_layout\":\"" << layer.input_layout << "\","
+         << "\"output_layout\":\"" << layer.output_layout << "\""
+         << "}";
+    }
+    os << "}";
+  }
+  os << "],";
+
+  os << "\"edges\":[";
+  for (size_t i = 0; i < edges.size(); ++i) {
+    if (i != 0) {
+      os << ",";
+    }
+    const EdgePlanSpec& edge = edges[i];
+    os << "{"
+       << "\"src_layer_id\":" << edge.src_layer_id << ","
+       << "\"dst_layer_id\":" << edge.dst_layer_id << ","
+       << "\"edge_kind\":\"" << edge.edge_kind << "\""
+       << "}";
+  }
+  os << "]"
+     << "}";
+  return ffi::String(os.str());
+}
+
 class LoadSourceVerifier : public ExprVisitor {
  public:
   LoadSourceVerifier(Buffer primary_input, Buffer secondary_input, Buffer weight)
@@ -128,122 +471,13 @@ class LoadSourceVerifier : public ExprVisitor {
   bool saw_weight_{false};
 };
 
-class StemPatternVerifier : public StmtExprVisitor {
- public:
-  StemPatternVerifier(Buffer input, Buffer weight, Buffer output)
-      : input_(std::move(input)), weight_(std::move(weight)), output_(std::move(output)) {}
-
-  bool matched() const {
-    return matched_store_ && loop_extents_.count(64) >= 1 && loop_extents_.count(112) >= 2;
-  }
-
- private:
-  void VisitStmt_(const ForNode* op) final {
-    if (const auto* imm = op->extent.as<IntImmNode>()) {
-      loop_extents_.insert(imm->value);
-    }
-    StmtExprVisitor::VisitStmt_(op);
-  }
-
-  void VisitStmt_(const BufferStoreNode* op) final {
-    if (!pad_buffer_.defined()) {
-      std::vector<int64_t> shape = ExpectConstantShape(op->buffer, "pad");
-      if (IsShape(shape, {1, 3, 230, 230})) {
-        LoadSourceVerifier verifier(input_, Buffer(), weight_);
-        verifier(op->value);
-        if (verifier.saw_primary_input()) {
-          pad_buffer_ = op->buffer;
-        }
-      }
-    }
-
-    if (op->buffer.same_as(output_)) {
-      LoadSourceVerifier verifier(input_, pad_buffer_, weight_);
-      verifier(op->value);
-      if ((verifier.saw_primary_input() || verifier.saw_secondary_input()) && verifier.saw_weight()) {
-        matched_store_ = true;
-      }
-    }
-    StmtExprVisitor::VisitStmt_(op);
-  }
-
-  Buffer input_;
-  Buffer weight_;
-  Buffer output_;
-  Buffer pad_buffer_;
-  bool matched_store_{false};
-  std::multiset<int64_t> loop_extents_;
-};
-
-bool IsFixedShapeResNet18Stem(const PrimFunc& func) {
-  Buffer input;
-  Buffer weight;
-  Buffer output;
-  for (const auto& [param, buffer] : func->buffer_map) {
-    if (buffer->dtype != DataType::Float(32)) {
-      continue;
-    }
-
-    std::vector<int64_t> shape = ExpectConstantShape(buffer, "candidate");
-    if (IsShape(shape, {1, 3, 224, 224})) {
-      TVM_FFI_CHECK(!input.defined(), ValueError)
-          << "IdentifyTyphoonResNet18 found multiple input-shaped buffers";
-      input = buffer;
-    } else if (IsShape(shape, {64, 3, 7, 7})) {
-      TVM_FFI_CHECK(!weight.defined(), ValueError)
-          << "IdentifyTyphoonResNet18 found multiple weight-shaped buffers";
-      weight = buffer;
-    } else if (IsShape(shape, {1, 64, 112, 112})) {
-      TVM_FFI_CHECK(!output.defined(), ValueError)
-          << "IdentifyTyphoonResNet18 found multiple output-shaped buffers";
-      output = buffer;
-    }
-  }
-
-  if (!input.defined() || !weight.defined() || !output.defined()) {
-    return false;
-  }
-
-  StemPatternVerifier verifier(input, weight, output);
-  verifier(func->body);
-  return verifier.matched();
-}
-
-ffi::String BuildResNet18PlanJSON() {
-  std::ostringstream os;
-  os << "{"
-     << "\"model\":\"resnet18\","
-     << "\"recognized_scope\":\"stem\","
-     << "\"input_shape\":[1,3,224,224],"
-     << "\"dtype\":\"float32\","
-     << "\"blocks\":[{"
-     << "\"stage_id\":0,"
-     << "\"block_id\":0,"
-     << "\"layer_ids\":[0]"
-     << "}],"
-     << "\"layers\":[{"
-     << "\"layer_id\":0,"
-     << "\"stage_id\":0,"
-     << "\"block_id\":0,"
-     << "\"kind\":\"conv2d\","
-     << "\"op_name\":\"stem_conv\","
-     << "\"logical_input_shape\":[1,3,224,224],"
-     << "\"logical_output_shape\":[1,64,112,112],"
-     << "\"weight_shape\":[64,3,7,7],"
-     << "\"requires_im2col\":true,"
-     << "\"preferred_output_layout\":\"zZ\""
-     << "}]"
-     << "}";
-  return ffi::String(os.str());
-}
-
 }  // namespace
 
 namespace transform {
 
 Pass IdentifyTyphoonResNet18() {
   auto pass_func = [](IRModule mod, PassContext ctx) {
-    std::vector<PrimFunc> typhoon_funcs;
+    std::vector<NamedPrimFunc> typhoon_funcs;
     for (const auto& [gvar, base_func] : mod->functions) {
       const auto* func = base_func.as<PrimFuncNode>();
       if (func == nullptr) {
@@ -254,32 +488,29 @@ Pass IdentifyTyphoonResNet18() {
       if (!target.defined() || target.value()->kind->name != "typhoon") {
         continue;
       }
-      typhoon_funcs.push_back(ffi::GetRef<PrimFunc>(func));
+      typhoon_funcs.push_back(
+          NamedPrimFunc{GetGlobalSymbol(gvar, ffi::GetRef<PrimFunc>(func)), ffi::GetRef<PrimFunc>(func)});
     }
 
     if (typhoon_funcs.empty()) {
       return mod;
     }
 
-    TVM_FFI_CHECK_EQ(typhoon_funcs.size(), 1U, ValueError)
-        << "IdentifyTyphoonResNet18 currently requires a single typhoon PrimFunc";
-
-    ExistingTyphoonGraphDetector detector;
-    detector(typhoon_funcs.front()->body);
-    if (detector.found_graph_ops()) {
-      return mod;
+    for (const NamedPrimFunc& entry : typhoon_funcs) {
+      ExistingTyphoonGraphDetector detector;
+      detector(entry.func->body);
+      if (detector.found_graph_ops()) {
+        return mod;
+      }
     }
 
-    if (IsFixedShapeResNet18Stem(typhoon_funcs.front())) {
+    if (IsCanonicalResNet18FullGraph(typhoon_funcs)) {
       return WithAttr(std::move(mod), "typhoon_resnet18_plan", BuildResNet18PlanJSON());
     }
 
-    if (!typhoon_funcs.empty()) {
-      TVM_FFI_THROW(ValueError)
-          << "IdentifyTyphoonResNet18 only supports fixed-shape ResNet18 stem graphs "
-          << "(1x3x224x224 -> 1x64x112x112, float32)";
-    }
-    return mod;
+    TVM_FFI_THROW(ValueError)
+        << "IdentifyTyphoonResNet18 only supports the canonical fixed-shape full ResNet18 graph "
+        << "(batch-norm-folded float32 1x3x224x224)";
   };
   return CreateModulePass(pass_func, 0, "tirx.IdentifyTyphoonResNet18", {});
 }

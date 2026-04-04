@@ -15,10 +15,35 @@
 # specific language governing permissions and limitations
 # under the License.
 
-import json
-
 import pytest
 import tvm
+
+from tests.python.tirx_transform.typhoon_resnet18_test_utils import (
+    build_canonical_resnet18_tir_module,
+)
+
+
+def _bind_typhoon_target(mod):
+    target = tvm.target.Target({"kind": "typhoon"})
+    functions = {}
+    for gvar, func in mod.functions.items():
+        if isinstance(func, tvm.tirx.PrimFunc):
+            functions[gvar] = func.with_attr("target", target)
+        else:
+            functions[gvar] = func
+    return tvm.IRModule(functions, attrs=mod.attrs)
+
+
+def build_targeted_canonical_resnet18_tir_module():
+    return _bind_typhoon_target(build_canonical_resnet18_tir_module())
+
+
+def build_resnet18_with_batch_norm_tir_module():
+    mod = build_targeted_canonical_resnet18_tir_module()
+    functions = dict(mod.functions.items())
+    source = next(func for func in functions.values() if isinstance(func, tvm.tirx.PrimFunc))
+    functions[tvm.ir.GlobalVar("batch_norm")] = source.with_attr("global_symbol", "batch_norm")
+    return tvm.IRModule(functions, attrs=mod.attrs)
 
 
 def _make_body(input_buffer, weight_buffer, output_buffer, body_kind):
@@ -228,22 +253,17 @@ def test_typhoon_resnet18_rejects_modules_with_multiple_typhoon_funcs():
         tvm.tirx.transform.IdentifyTyphoonResNet18()(mod)
 
 
-def test_typhoon_resnet18_accepts_fixed_shape_resnet18_conv_stem():
-    mod = build_resnet18_stem_tir_module()
-    out = tvm.tirx.transform.IdentifyTyphoonResNet18()(mod)
-    assert "typhoon_resnet18_plan" in out.attrs
-
-    plan = json.loads(out.attrs["typhoon_resnet18_plan"])
-    assert plan["model"] == "resnet18"
-    assert plan["recognized_scope"] == "stem"
-    assert plan["input_shape"] == [1, 3, 224, 224]
-    assert plan["dtype"] == "float32"
-    assert plan["layers"][0]["op_name"] == "stem_conv"
-    assert plan["layers"][0]["block_id"] == 0
-    assert plan["layers"][0]["weight_shape"] == [64, 3, 7, 7]
+@pytest.mark.parametrize(
+    "builder",
+    [build_resnet18_stem_tir_module, build_padded_resnet18_stem_module],
+)
+def test_typhoon_resnet18_rejects_stem_only_modules(builder):
+    mod = builder()
+    with pytest.raises(ValueError, match="full|canonical|ResNet18"):
+        tvm.tirx.transform.IdentifyTyphoonResNet18()(mod)
 
 
-def test_typhoon_resnet18_accepts_padded_stem_lowering_form():
-    mod = build_padded_resnet18_stem_module()
-    out = tvm.tirx.transform.IdentifyTyphoonResNet18()(mod)
-    assert "typhoon_resnet18_plan" in out.attrs
+def test_typhoon_resnet18_rejects_graphs_with_explicit_batch_norm():
+    mod = build_resnet18_with_batch_norm_tir_module()
+    with pytest.raises(ValueError, match="BatchNormalization|canonical"):
+        tvm.tirx.transform.IdentifyTyphoonResNet18()(mod)
