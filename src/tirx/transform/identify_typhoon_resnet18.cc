@@ -86,19 +86,6 @@ std::vector<int64_t> ExpectConstantShape(const Buffer& buffer, const char* name)
   return shape;
 }
 
-bool IsShape(const std::vector<int64_t>& actual, std::initializer_list<int64_t> expected) {
-  if (actual.size() != expected.size()) {
-    return false;
-  }
-  size_t index = 0;
-  for (int64_t value : expected) {
-    if (actual[index++] != value) {
-      return false;
-    }
-  }
-  return true;
-}
-
 std::string ToLower(std::string value) {
   std::transform(value.begin(), value.end(), value.begin(),
                  [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
