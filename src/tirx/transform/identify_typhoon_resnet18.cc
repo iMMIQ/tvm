@@ -122,6 +122,124 @@ std::vector<std::vector<int64_t>> GetOrderedBufferShapes(const PrimFunc& func) {
   return shapes;
 }
 
+class CanonicalBufferAccessVerifier : public StmtExprVisitor {
+ public:
+  CanonicalBufferAccessVerifier(Buffer output, std::vector<Buffer> required_inputs)
+      : output_(std::move(output)), required_inputs_(std::move(required_inputs)) {
+    saw_required_input_.assign(required_inputs_.size(), false);
+  }
+
+  bool Matched() const {
+    return saw_output_store_ &&
+           std::all_of(saw_required_input_.begin(), saw_required_input_.end(),
+                       [](bool seen) { return seen; });
+  }
+
+ private:
+  void VisitStmt_(const BufferStoreNode* op) final {
+    if (op->buffer.same_as(output_)) {
+      saw_output_store_ = true;
+    }
+    StmtExprVisitor::VisitStmt_(op);
+  }
+
+  void VisitExpr_(const BufferLoadNode* op) final {
+    for (size_t i = 0; i < required_inputs_.size(); ++i) {
+      if (op->buffer.same_as(required_inputs_[i])) {
+        saw_required_input_[i] = true;
+      }
+    }
+    StmtExprVisitor::VisitExpr_(op);
+  }
+
+  Buffer output_;
+  std::vector<Buffer> required_inputs_;
+  std::vector<bool> saw_required_input_;
+  bool saw_output_store_{false};
+};
+
+enum class CanonicalSemanticKind {
+  kCopyLike,
+  kElementwiseAdd,
+  kMaxLike,
+  kMulAddReduce,
+  kMean,
+};
+
+CanonicalSemanticKind GetExpectedSemanticKind(const std::string& symbol) {
+  if (symbol.rfind("conv2d", 0) == 0 || symbol == "matmul") {
+    return CanonicalSemanticKind::kMulAddReduce;
+  }
+  if (symbol.rfind("add", 0) == 0) {
+    return CanonicalSemanticKind::kElementwiseAdd;
+  }
+  if (symbol.rfind("relu", 0) == 0 || symbol == "max_pool2d") {
+    return CanonicalSemanticKind::kMaxLike;
+  }
+  if (symbol == "mean") {
+    return CanonicalSemanticKind::kMean;
+  }
+  return CanonicalSemanticKind::kCopyLike;
+}
+
+class CanonicalSemanticVerifier : public StmtExprVisitor {
+ public:
+  explicit CanonicalSemanticVerifier(Buffer output) : output_(std::move(output)) {}
+
+  bool Matches(CanonicalSemanticKind kind) const {
+    switch (kind) {
+      case CanonicalSemanticKind::kCopyLike:
+        return true;
+      case CanonicalSemanticKind::kElementwiseAdd:
+        return saw_add_;
+      case CanonicalSemanticKind::kMaxLike:
+        return saw_max_;
+      case CanonicalSemanticKind::kMulAddReduce:
+        return saw_mul_ && saw_add_ && saw_output_accumulator_load_;
+      case CanonicalSemanticKind::kMean:
+        return saw_div_;
+    }
+    return false;
+  }
+
+ private:
+  using Parent = StmtExprVisitor;
+
+  void VisitExpr_(const BufferLoadNode* op) final {
+    if (op->buffer.same_as(output_)) {
+      saw_output_accumulator_load_ = true;
+    }
+    Parent::VisitExpr_(op);
+  }
+
+  void VisitExpr_(const AddNode* op) final {
+    saw_add_ = true;
+    Parent::VisitExpr_(op);
+  }
+
+  void VisitExpr_(const MulNode* op) final {
+    saw_mul_ = true;
+    Parent::VisitExpr_(op);
+  }
+
+  void VisitExpr_(const DivNode* op) final {
+    saw_div_ = true;
+    Parent::VisitExpr_(op);
+  }
+
+  void VisitExpr_(const MaxNode* op) final {
+    saw_max_ = true;
+    Parent::VisitExpr_(op);
+  }
+
+  Buffer output_;
+  bool saw_add_{false};
+  bool saw_mul_{false};
+  bool saw_div_{false};
+  bool saw_max_{false};
+  bool saw_output_accumulator_load_{false};
+};
+
 struct NamedPrimFunc {
   std::string symbol;
   PrimFunc func;
@@ -178,6 +296,44 @@ bool MatchesExpectedBufferShapes(const PrimFunc& func,
   return GetOrderedBufferShapes(func) == expected_shapes;
 }
 
+bool MatchesExpectedBufferAccesses(const PrimFunc& func) {
+  std::vector<Buffer> ordered_buffers;
+  ordered_buffers.reserve(func->params.size());
+  for (const Var& param : func->params) {
+    auto it = func->buffer_map.find(param);
+    TVM_FFI_CHECK(it != func->buffer_map.end(), ValueError)
+        << "IdentifyTyphoonResNet18 requires PrimFunc params to be bound to buffers";
+    ordered_buffers.push_back((*it).second);
+  }
+
+  TVM_FFI_CHECK_GE(ordered_buffers.size(), 2U, ValueError)
+      << "IdentifyTyphoonResNet18 requires canonical operator functions to have at least "
+         "one input and one output buffer";
+
+  Buffer output = ordered_buffers.back();
+  ordered_buffers.pop_back();
+  CanonicalBufferAccessVerifier verifier(output, std::move(ordered_buffers));
+  verifier(func->body);
+  return verifier.Matched();
+}
+
+bool MatchesExpectedSemantics(const std::string& symbol, const PrimFunc& func) {
+  std::vector<Buffer> ordered_buffers;
+  ordered_buffers.reserve(func->params.size());
+  for (const Var& param : func->params) {
+    auto it = func->buffer_map.find(param);
+    TVM_FFI_CHECK(it != func->buffer_map.end(), ValueError)
+        << "IdentifyTyphoonResNet18 requires PrimFunc params to be bound to buffers";
+    ordered_buffers.push_back((*it).second);
+  }
+  TVM_FFI_CHECK(!ordered_buffers.empty(), ValueError)
+      << "IdentifyTyphoonResNet18 requires canonical operator functions to have buffers";
+
+  CanonicalSemanticVerifier verifier(ordered_buffers.back());
+  verifier(func->body);
+  return verifier.Matches(GetExpectedSemanticKind(symbol));
+}
+
 bool IsCanonicalResNet18FullGraph(const std::vector<NamedPrimFunc>& typhoon_funcs) {
   const auto& specs = GetCanonicalFunctionSpecs();
   std::set<std::string> expected_symbols;
@@ -211,6 +367,12 @@ bool IsCanonicalResNet18FullGraph(const std::vector<NamedPrimFunc>& typhoon_func
       return false;
     }
     if (!MatchesExpectedBufferShapes(it->second, spec.buffer_shapes)) {
+      return false;
+    }
+    if (!MatchesExpectedBufferAccesses(it->second)) {
+      return false;
+    }
+    if (!MatchesExpectedSemantics(spec.symbol, it->second)) {
       return false;
     }
   }
@@ -465,6 +627,7 @@ namespace transform {
 Pass IdentifyTyphoonResNet18() {
   auto pass_func = [](IRModule mod, PassContext ctx) {
     std::vector<NamedPrimFunc> typhoon_funcs;
+    int num_graphized_funcs = 0;
     for (const auto& [gvar, base_func] : mod->functions) {
       const auto* func = base_func.as<PrimFuncNode>();
       if (func == nullptr) {
@@ -477,18 +640,23 @@ Pass IdentifyTyphoonResNet18() {
       }
       typhoon_funcs.push_back(
           NamedPrimFunc{GetGlobalSymbol(gvar, ffi::GetRef<PrimFunc>(func)), ffi::GetRef<PrimFunc>(func)});
+      ExistingTyphoonGraphDetector detector;
+      detector(func->body);
+      if (detector.found_graph_ops()) {
+        ++num_graphized_funcs;
+      }
     }
 
     if (typhoon_funcs.empty()) {
       return mod;
     }
 
-    for (const NamedPrimFunc& entry : typhoon_funcs) {
-      ExistingTyphoonGraphDetector detector;
-      detector(entry.func->body);
-      if (detector.found_graph_ops()) {
-        return mod;
-      }
+    if (num_graphized_funcs == static_cast<int>(typhoon_funcs.size())) {
+      return mod;
+    }
+    if (num_graphized_funcs != 0) {
+      TVM_FFI_THROW(ValueError)
+          << "IdentifyTyphoonResNet18 does not support mixed raw and graphized typhoon modules";
     }
 
     if (IsCanonicalResNet18FullGraph(typhoon_funcs)) {

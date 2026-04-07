@@ -49,6 +49,8 @@ dependencies = [
   "cloudpickle",
   "ml_dtypes",
   "numpy",
+  "onnx>=1.21.0",
+  "onnxruntime>=1.24.3",
   "packaging",
   "psutil",
   "scipy",
@@ -120,18 +122,18 @@ Repository = "https://github.com/apache/tvm"
 cmake.source-dir = "."
 cmake.build-type = "Release"
 
-# Configure the wheel to be Python version-agnostic
-wheel.py-api = "py3"
-
-# Build configuration
-build-dir = "build"
-
 # CMake configuration - ensure proper installation paths
 cmake.args = ["-DTVM_BUILD_PYTHON_MODULE=ON"]
+
+# Configure the wheel to be Python version-agnostic
+wheel.py-api = "py3"
 
 # Wheel configuration
 wheel.packages = ["python/tvm"]
 wheel.install-dir = "tvm"
+
+# Build configuration
+build-dir = "build"
 
 # Source distribution configuration
 sdist.include = [

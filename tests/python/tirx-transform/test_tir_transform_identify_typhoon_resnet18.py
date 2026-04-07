@@ -46,6 +46,40 @@ def build_resnet18_with_batch_norm_tir_module():
     return tvm.IRModule(functions, attrs=mod.attrs)
 
 
+def build_canonical_resnet18_with_trivial_relu():
+    mod = build_targeted_canonical_resnet18_tir_module()
+    functions = dict(mod.functions.items())
+    gvar = next(gvar for gvar in functions if gvar.name_hint == "relu")
+    relu = functions[gvar]
+    functions[gvar] = relu.with_body(tvm.tirx.Evaluate(0))
+    return tvm.IRModule(functions, attrs=mod.attrs)
+
+
+def build_canonical_resnet18_with_negating_relu():
+    mod = build_targeted_canonical_resnet18_tir_module()
+    functions = dict(mod.functions.items())
+    gvar = next(gvar for gvar in functions if gvar.name_hint == "relu")
+    relu = functions[gvar]
+    input_buffer = relu.buffer_map[relu.params[0]]
+    output_buffer = relu.buffer_map[relu.params[1]]
+    body = tvm.tirx.BufferStore(
+        output_buffer,
+        -tvm.tirx.BufferLoad(input_buffer, [0, 0, 0, 0]),
+        [0, 0, 0, 0],
+    )
+    functions[gvar] = relu.with_body(body)
+    return tvm.IRModule(functions, attrs=mod.attrs)
+
+
+def build_mixed_graphized_and_raw_typhoon_module():
+    raw = _make_func((1, 3, 224, 224), (1, 64, 112, 112)).with_attr("global_symbol", "raw")
+    graphized = tvm.tirx.PrimFunc(
+        [],
+        tvm.tirx.typhoon.submit_graph(0),
+    ).with_attr("target", tvm.target.Target({"kind": "typhoon"})).with_attr("global_symbol", "graphized")
+    return tvm.IRModule({"raw": raw, "graphized": graphized})
+
+
 def _make_body(input_buffer, weight_buffer, output_buffer, body_kind):
     if body_kind == "stem":
         oc = tvm.tirx.Var("oc", "int32")
@@ -266,4 +300,22 @@ def test_typhoon_resnet18_rejects_stem_only_modules(builder):
 def test_typhoon_resnet18_rejects_graphs_with_explicit_batch_norm():
     mod = build_resnet18_with_batch_norm_tir_module()
     with pytest.raises(ValueError, match="BatchNormalization|canonical"):
+        tvm.tirx.transform.IdentifyTyphoonResNet18()(mod)
+
+
+def test_typhoon_resnet18_rejects_canonical_symbol_set_with_trivial_body():
+    mod = build_canonical_resnet18_with_trivial_relu()
+    with pytest.raises(ValueError, match="canonical|full|ResNet18"):
+        tvm.tirx.transform.IdentifyTyphoonResNet18()(mod)
+
+
+def test_typhoon_resnet18_rejects_canonical_symbol_set_with_wrong_relu_semantics():
+    mod = build_canonical_resnet18_with_negating_relu()
+    with pytest.raises(ValueError, match="canonical|full|ResNet18"):
+        tvm.tirx.transform.IdentifyTyphoonResNet18()(mod)
+
+
+def test_typhoon_resnet18_rejects_mixed_raw_and_graphized_modules():
+    mod = build_mixed_graphized_and_raw_typhoon_module()
+    with pytest.raises(ValueError, match="mixed|graphized|graph"):
         tvm.tirx.transform.IdentifyTyphoonResNet18()(mod)

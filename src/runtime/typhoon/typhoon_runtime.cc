@@ -24,6 +24,7 @@
 #include <cstring>
 #include <tvm/ffi/function.h>
 #include <tvm/ffi/reflection/registry.h>
+#include <tvm/runtime/threading_backend.h>
 
 #include <mutex>
 #include <limits>
@@ -39,13 +40,12 @@ namespace typhoon {
 
 namespace {
 
-const TyphoonRegion& FindRegion(const TyphoonGraphBuilder& graph, int32_t region_id) {
-  for (const auto& region : graph.regions()) {
-    if (region.region_id == region_id) {
-      return region;
-    }
-  }
-  throw std::runtime_error("Unknown Typhoon region " + std::to_string(region_id));
+constexpr int64_t kTyphoonParallelOuterThreshold = 4;
+constexpr int64_t kTyphoonParallelWorkThreshold = 1 << 15;
+
+bool ShouldParallelize(int64_t outer_extent, int64_t total_work) {
+  return outer_extent >= kTyphoonParallelOuterThreshold &&
+         total_work >= kTyphoonParallelWorkThreshold;
 }
 
 template <typename T = uint8_t>
@@ -65,8 +65,8 @@ void ExecuteTask(const TyphoonGraphBuilder& graph, const TyphoonTask& task, std:
   switch (task.kind) {
     case TaskKind::kDMA: {
       const auto& region =
-          task.direction == 0 ? FindRegion(graph, task.writes.at(0)) : FindRegion(graph, task.reads.at(0));
-      uint8_t* sram_ptr = SramPtr<>(sram, region);
+          task.direction == 0 ? graph.GetRegion(task.writes.at(0)) : graph.GetRegion(task.reads.at(0));
+      uint8_t* sram_ptr = SramPtr<>(sram, region) + task.sram_byte_offset;
       uint8_t* global_ptr = reinterpret_cast<uint8_t*>(task.global_endpoint.handle) + task.global_endpoint.byte_offset;
       if (task.direction == 0) {
         std::memcpy(sram_ptr, global_ptr, static_cast<size_t>(task.bytes));
@@ -76,10 +76,29 @@ void ExecuteTask(const TyphoonGraphBuilder& graph, const TyphoonTask& task, std:
       return;
     }
     case TaskKind::kReshape: {
-      const auto& input = FindRegion(graph, task.reads.at(0));
-      const auto& output = FindRegion(graph, task.writes.at(0));
+      const auto& input = graph.GetRegion(task.reads.at(0));
+      const auto& output = graph.GetRegion(task.writes.at(0));
       if (task.transform_code == 0) {
         std::memcpy(SramPtr<>(sram, output), SramPtr<>(sram, input), static_cast<size_t>(task.elem_count));
+        return;
+      }
+      if (task.transform_code == 2) {
+        auto* input_ptr = SramPtr<float>(sram, input);
+        auto* output_ptr = SramPtr<float>(sram, output);
+        int64_t rows = MetadataAt(task, 0, "reshape");
+        int64_t cols = MetadataAt(task, 1, "reshape");
+        auto transpose_row = [&](int64_t row) {
+          for (int64_t col = 0; col < cols; ++col) {
+            output_ptr[col * rows + row] = input_ptr[row * cols + col];
+          }
+        };
+        if (ShouldParallelize(rows, rows * cols)) {
+          tvm::runtime::parallel_for_with_threading_backend(transpose_row, 0, rows);
+        } else {
+          for (int64_t row = 0; row < rows; ++row) {
+            transpose_row(row);
+          }
+        }
         return;
       }
       if (task.transform_code != 1) {
@@ -101,28 +120,39 @@ void ExecuteTask(const TyphoonGraphBuilder& graph, const TyphoonTask& task, std:
       int64_t pad_w = MetadataAt(task, 9, "reshape");
       int64_t out_h = MetadataAt(task, 10, "reshape");
       int64_t out_w = MetadataAt(task, 11, "reshape");
+      int64_t input_origin_h = task.metadata.size() >= 16 ? MetadataAt(task, 12, "reshape") : 0;
+      int64_t input_origin_w = task.metadata.size() >= 16 ? MetadataAt(task, 13, "reshape") : 0;
+      int64_t output_origin_h = task.metadata.size() >= 16 ? MetadataAt(task, 14, "reshape") : 0;
+      int64_t output_origin_w = task.metadata.size() >= 16 ? MetadataAt(task, 15, "reshape") : 0;
       int64_t patch_size = c * kernel_h * kernel_w;
 
-      for (int64_t ni = 0; ni < n; ++ni) {
-        for (int64_t oh = 0; oh < out_h; ++oh) {
-          for (int64_t ow = 0; ow < out_w; ++ow) {
-            int64_t row = ((ni * out_h) + oh) * out_w + ow;
-            for (int64_t ci = 0; ci < c; ++ci) {
-              for (int64_t kh = 0; kh < kernel_h; ++kh) {
-                for (int64_t kw = 0; kw < kernel_w; ++kw) {
-                  int64_t ih = oh * stride_h + kh - pad_h;
-                  int64_t iw = ow * stride_w + kw - pad_w;
-                  int64_t col = ((ci * kernel_h) + kh) * kernel_w + kw;
-                  float value = 0.0f;
-                  if (ih >= 0 && ih < in_h && iw >= 0 && iw < in_w) {
-                    int64_t input_index = ((ni * c + ci) * in_h + ih) * in_w + iw;
-                    value = input_ptr[input_index];
-                  }
-                  output_ptr[row * patch_size + col] = value;
-                }
+      int64_t row_count = n * out_h * out_w;
+      auto write_im2col_row = [&](int64_t row) {
+        int64_t ni = row / (out_h * out_w);
+        int64_t rem = row % (out_h * out_w);
+        int64_t oh = rem / out_w;
+        int64_t ow = rem % out_w;
+        for (int64_t ci = 0; ci < c; ++ci) {
+          for (int64_t kh = 0; kh < kernel_h; ++kh) {
+            for (int64_t kw = 0; kw < kernel_w; ++kw) {
+              int64_t ih = (output_origin_h + oh) * stride_h + kh - pad_h - input_origin_h;
+              int64_t iw = (output_origin_w + ow) * stride_w + kw - pad_w - input_origin_w;
+              int64_t col = ((ci * kernel_h) + kh) * kernel_w + kw;
+              float value = 0.0f;
+              if (ih >= 0 && ih < in_h && iw >= 0 && iw < in_w) {
+                int64_t input_index = ((ni * c + ci) * in_h + ih) * in_w + iw;
+                value = input_ptr[input_index];
               }
+              output_ptr[row * patch_size + col] = value;
             }
           }
+        }
+      };
+      if (ShouldParallelize(row_count, row_count * patch_size)) {
+        tvm::runtime::parallel_for_with_threading_backend(write_im2col_row, 0, row_count);
+      } else {
+        for (int64_t row = 0; row < row_count; ++row) {
+          write_im2col_row(row);
         }
       }
       return;
@@ -131,16 +161,26 @@ void ExecuteTask(const TyphoonGraphBuilder& graph, const TyphoonTask& task, std:
       if (task.dtype_code != 2) {
         throw std::runtime_error("Typhoon vector execution currently supports dtype_code=2 only");
       }
-      const auto& in0 = FindRegion(graph, task.reads.at(0));
-      const auto& out = FindRegion(graph, task.writes.at(0));
+      const auto& in0 = graph.GetRegion(task.reads.at(0));
+      const auto& out = graph.GetRegion(task.writes.at(0));
       auto* in0_ptr = SramPtr<float>(sram, in0);
       auto* out_ptr = SramPtr<float>(sram, out);
 
       if (task.op_code == 0) {
-        const auto& in1 = FindRegion(graph, task.reads.at(1));
+        const auto& in1 = graph.GetRegion(task.reads.at(1));
         auto* in1_ptr = SramPtr<float>(sram, in1);
-        for (int64_t i = 0; i < task.elem_count; ++i) {
-          out_ptr[i] = in0_ptr[i] + in1_ptr[i];
+        if (task.metadata.empty()) {
+          for (int64_t i = 0; i < task.elem_count; ++i) {
+            out_ptr[i] = in0_ptr[i] + in1_ptr[i];
+          }
+        } else {
+          int64_t outer = MetadataAt(task, 0, "vector");
+          int64_t inner = MetadataAt(task, 1, "vector");
+          for (int64_t i = 0; i < outer; ++i) {
+            for (int64_t j = 0; j < inner; ++j) {
+              out_ptr[i * inner + j] = in0_ptr[i * inner + j] + in1_ptr[j];
+            }
+          }
         }
         return;
       }
@@ -165,25 +205,34 @@ void ExecuteTask(const TyphoonGraphBuilder& graph, const TyphoonTask& task, std:
         int64_t pad_w = MetadataAt(task, 9, "vector");
         int64_t out_h = MetadataAt(task, 10, "vector");
         int64_t out_w = MetadataAt(task, 11, "vector");
-        for (int64_t ni = 0; ni < n; ++ni) {
-          for (int64_t ci = 0; ci < c; ++ci) {
-            for (int64_t oh = 0; oh < out_h; ++oh) {
-              for (int64_t ow = 0; ow < out_w; ++ow) {
-                float best = -std::numeric_limits<float>::infinity();
-                for (int64_t kh = 0; kh < kernel_h; ++kh) {
-                  for (int64_t kw = 0; kw < kernel_w; ++kw) {
-                    int64_t ih = oh * stride_h + kh - pad_h;
-                    int64_t iw = ow * stride_w + kw - pad_w;
-                    if (ih >= 0 && ih < in_h && iw >= 0 && iw < in_w) {
-                      int64_t input_index = ((ni * c + ci) * in_h + ih) * in_w + iw;
-                      best = std::max(best, in0_ptr[input_index]);
-                    }
-                  }
-                }
-                int64_t output_index = ((ni * c + ci) * out_h + oh) * out_w + ow;
-                out_ptr[output_index] = best;
+        int64_t output_count = n * c * out_h * out_w;
+        auto compute_maxpool_output = [&](int64_t output_index) {
+          int64_t tmp = output_index;
+          int64_t ow = tmp % out_w;
+          tmp /= out_w;
+          int64_t oh = tmp % out_h;
+          tmp /= out_h;
+          int64_t ci = tmp % c;
+          int64_t ni = tmp / c;
+          float best = -std::numeric_limits<float>::infinity();
+          for (int64_t kh = 0; kh < kernel_h; ++kh) {
+            for (int64_t kw = 0; kw < kernel_w; ++kw) {
+              int64_t ih = oh * stride_h + kh - pad_h;
+              int64_t iw = ow * stride_w + kw - pad_w;
+              if (ih >= 0 && ih < in_h && iw >= 0 && iw < in_w) {
+                int64_t input_index = ((ni * c + ci) * in_h + ih) * in_w + iw;
+                best = std::max(best, in0_ptr[input_index]);
               }
             }
+          }
+          out_ptr[output_index] = best;
+        };
+        if (ShouldParallelize(output_count, output_count * kernel_h * kernel_w)) {
+          tvm::runtime::parallel_for_with_threading_backend(compute_maxpool_output, 0,
+                                                            output_count);
+        } else {
+          for (int64_t output_index = 0; output_index < output_count; ++output_index) {
+            compute_maxpool_output(output_index);
           }
         }
         return;
@@ -195,16 +244,24 @@ void ExecuteTask(const TyphoonGraphBuilder& graph, const TyphoonTask& task, std:
         int64_t in_h = MetadataAt(task, 2, "vector");
         int64_t in_w = MetadataAt(task, 3, "vector");
         float denom = static_cast<float>(in_h * in_w);
-        for (int64_t ni = 0; ni < n; ++ni) {
-          for (int64_t ci = 0; ci < c; ++ci) {
-            float sum = 0.0f;
-            for (int64_t ih = 0; ih < in_h; ++ih) {
-              for (int64_t iw = 0; iw < in_w; ++iw) {
-                int64_t input_index = ((ni * c + ci) * in_h + ih) * in_w + iw;
-                sum += in0_ptr[input_index];
-              }
+        int64_t output_count = n * c;
+        auto compute_gap_output = [&](int64_t output_index) {
+          int64_t ni = output_index / c;
+          int64_t ci = output_index % c;
+          float sum = 0.0f;
+          for (int64_t ih = 0; ih < in_h; ++ih) {
+            for (int64_t iw = 0; iw < in_w; ++iw) {
+              int64_t input_index = ((ni * c + ci) * in_h + ih) * in_w + iw;
+              sum += in0_ptr[input_index];
             }
-            out_ptr[ni * c + ci] = sum / denom;
+          }
+          out_ptr[output_index] = sum / denom;
+        };
+        if (ShouldParallelize(output_count, output_count * in_h * in_w)) {
+          tvm::runtime::parallel_for_with_threading_backend(compute_gap_output, 0, output_count);
+        } else {
+          for (int64_t output_index = 0; output_index < output_count; ++output_index) {
+            compute_gap_output(output_index);
           }
         }
         return;
@@ -217,19 +274,35 @@ void ExecuteTask(const TyphoonGraphBuilder& graph, const TyphoonTask& task, std:
       if (task.dtype_code != 2) {
         throw std::runtime_error("Typhoon matmul execution currently supports dtype_code=2 only");
       }
-      const auto& a = FindRegion(graph, task.reads.at(0));
-      const auto& b = FindRegion(graph, task.reads.at(1));
-      const auto& c = FindRegion(graph, task.writes.at(0));
+      const auto& a = graph.GetRegion(task.reads.at(0));
+      const auto& b = graph.GetRegion(task.reads.at(1));
+      const auto& c = graph.GetRegion(task.writes.at(0));
       auto* a_ptr = SramPtr<float>(sram, a);
       auto* b_ptr = SramPtr<float>(sram, b);
       auto* c_ptr = SramPtr<float>(sram, c);
-      for (int64_t i = 0; i < task.m; ++i) {
+      auto compute_output_row = [&](int64_t i) {
         for (int64_t j = 0; j < task.n; ++j) {
           float acc = 0.0f;
           for (int64_t kk = 0; kk < task.k; ++kk) {
-            acc += a_ptr[i * task.k + kk] * b_ptr[kk * task.n + j];
+            float rhs = 0.0f;
+            if (task.layout_code == 0) {
+              rhs = b_ptr[kk * task.n + j];
+            } else if (task.layout_code == 1) {
+              rhs = b_ptr[j * task.k + kk];
+            } else {
+              throw std::runtime_error("Typhoon matmul execution uses unsupported layout_code " +
+                                       std::to_string(task.layout_code));
+            }
+            acc += a_ptr[i * task.k + kk] * rhs;
           }
           c_ptr[i * task.n + j] = acc;
+        }
+      };
+      if (ShouldParallelize(task.m, task.m * task.n * task.k)) {
+        tvm::runtime::parallel_for_with_threading_backend(compute_output_row, 0, task.m);
+      } else {
+        for (int64_t i = 0; i < task.m; ++i) {
+          compute_output_row(i);
         }
       }
       return;
@@ -238,43 +311,10 @@ void ExecuteTask(const TyphoonGraphBuilder& graph, const TyphoonTask& task, std:
 }
 
 void ExecuteGraph(const TyphoonGraphBuilder& graph) {
-  const auto& tasks = graph.tasks();
-  std::unordered_map<int32_t, size_t> task_index = graph.task_index();
-  std::vector<int> remaining_deps(tasks.size(), 0);
-  std::vector<std::vector<size_t>> users(tasks.size());
-  for (size_t i = 0; i < tasks.size(); ++i) {
-    remaining_deps[i] = static_cast<int>(tasks[i].deps.size());
-    for (int32_t dep_id : tasks[i].deps) {
-      users.at(task_index.at(dep_id)).push_back(i);
-    }
-  }
-
   std::vector<uint8_t> sram(kTyphoonDefaultSRAMSize, 0);
-  std::vector<size_t> ready;
-  for (size_t i = 0; i < tasks.size(); ++i) {
-    if (remaining_deps[i] == 0) {
-      ready.push_back(i);
-    }
-  }
-
-  auto ready_cmp = [&tasks](size_t lhs, size_t rhs) {
-    if (tasks[lhs].task_id != tasks[rhs].task_id) {
-      return tasks[lhs].task_id < tasks[rhs].task_id;
-    }
-    return lhs < rhs;
-  };
-
-  while (!ready.empty()) {
-    std::sort(ready.begin(), ready.end(), ready_cmp);
-    size_t current = ready.front();
-    ready.erase(ready.begin());
-    ExecuteTask(graph, tasks[current], &sram);
-    for (size_t user : users[current]) {
-      --remaining_deps[user];
-      if (remaining_deps[user] == 0) {
-        ready.push_back(user);
-      }
-    }
+  const auto& tasks = graph.tasks();
+  for (size_t task_index : graph.topo_order()) {
+    ExecuteTask(graph, tasks[task_index], &sram);
   }
 }
 
@@ -317,12 +357,13 @@ class TyphoonRuntimeState {
   }
 
   int AddDMATask(int32_t graph_id, int32_t task_id, int32_t direction, void* global_handle,
-                 int64_t global_byte_offset, int32_t sram_region_id, int64_t bytes,
-                 int32_t num_deps, const int32_t* dep_ids) {
+                 int64_t global_byte_offset, int32_t sram_region_id,
+                 int64_t sram_byte_offset, int64_t bytes, int32_t num_deps,
+                 const int32_t* dep_ids) {
     return Call([&]() {
       GetOrCreateGraph(graph_id)
-          .AddDMATask(task_id, direction, global_handle, global_byte_offset, sram_region_id, bytes,
-                      num_deps, dep_ids);
+          .AddDMATask(task_id, direction, global_handle, global_byte_offset, sram_region_id,
+                      sram_byte_offset, bytes, num_deps, dep_ids);
     });
   }
 
@@ -423,11 +464,11 @@ extern "C" int TVMTyphoonDeclareRegion(int32_t graph_id, int32_t region_id, int6
 
 extern "C" int TVMTyphoonAddDMATask(int32_t graph_id, int32_t task_id, int32_t direction,
                                     void* global_handle, int64_t global_byte_offset,
-                                    int32_t sram_region_id, int64_t bytes, int32_t num_deps,
-                                    const int32_t* dep_ids) {
+                                    int32_t sram_region_id, int64_t sram_byte_offset,
+                                    int64_t bytes, int32_t num_deps, const int32_t* dep_ids) {
   return tvm::runtime::typhoon::TyphoonRuntimeState::Global().AddDMATask(
-      graph_id, task_id, direction, global_handle, global_byte_offset, sram_region_id, bytes,
-      num_deps, dep_ids);
+      graph_id, task_id, direction, global_handle, global_byte_offset, sram_region_id,
+      sram_byte_offset, bytes, num_deps, dep_ids);
 }
 
 extern "C" int TVMTyphoonAddMatmulTask(int32_t graph_id, int32_t task_id, int32_t a_region_id,

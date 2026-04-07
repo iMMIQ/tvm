@@ -61,13 +61,24 @@ def task_dma(
     sram_region_id,
     bytes,
     deps,
+    sram_byte_offset=0,
     span=None,
 ):
     call = tvm.tirx.call_intrin(
         "int32",
         "tirx.typhoon.task_dma",
         *_task_args(
-            [graph_id, task_id, direction, global_handle, global_byte_offset, sram_region_id, bytes], deps
+            [
+                graph_id,
+                task_id,
+                direction,
+                global_handle,
+                global_byte_offset,
+                sram_region_id,
+                sram_byte_offset,
+                bytes,
+            ],
+            deps,
         ),
         span=span,
     )

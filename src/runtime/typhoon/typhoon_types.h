@@ -63,6 +63,8 @@ struct TyphoonTask {
   int32_t direction{0};
   int32_t op_code{0};
   int32_t transform_code{0};
+  int32_t layout_code{0};
+  int64_t sram_byte_offset{0};
   int64_t bytes{0};
   int64_t elem_count{0};
   int32_t dtype_code{0};
@@ -79,6 +81,8 @@ struct TyphoonTraceRecord {
   int64_t end_time{0};
   int64_t sram_bytes_read{0};
   int64_t sram_bytes_written{0};
+  std::vector<int32_t> region_reads;
+  std::vector<int32_t> region_writes;
 };
 
 }  // namespace typhoon

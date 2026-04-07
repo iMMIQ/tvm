@@ -62,6 +62,8 @@ struct TyphoonTaskInfo {
   int64_t dtype_code{0};
   int64_t op_code{0};
   int64_t transform_code{0};
+  int64_t sram_byte_offset{0};
+  int64_t bytes{0};
   std::vector<int64_t> metadata;
 };
 
@@ -222,19 +224,23 @@ class TyphoonGraphVerifier : public StmtExprVisitor {
   }
 
   void CollectDMATask(const CallNode* call) {
-    TVM_FFI_CHECK_GE(call->args.size(), 8U, ValueError)
+    TVM_FFI_CHECK_GE(call->args.size(), 9U, ValueError)
         << "tirx.typhoon.task_dma expects dependency metadata";
 
     TyphoonTaskInfo task;
     RequireGraphId(call->args[0], "task_dma");
     task.task_id = ExpectInt(call->args[1], "task_id");
     task.kind = "dma";
-    task.deps = ParseDeps(call, /*num_deps_index=*/7, task.kind);
+    task.deps = ParseDeps(call, /*num_deps_index=*/8, task.kind);
 
     int64_t direction = ExpectInt(call->args[2], "direction");
     int64_t sram_region_id = ExpectInt(call->args[5], "sram_region_id");
-    int64_t bytes = ExpectInt(call->args[6], "bytes");
+    task.sram_byte_offset = ExpectInt(call->args[6], "sram_byte_offset");
+    int64_t bytes = ExpectInt(call->args[7], "bytes");
+    task.bytes = bytes;
     TVM_FFI_CHECK_GE(task.task_id, 0, ValueError) << "Typhoon task_id must be non-negative";
+    TVM_FFI_CHECK_GE(task.sram_byte_offset, 0, ValueError)
+        << "Typhoon DMA SRAM byte offset must be non-negative";
     TVM_FFI_CHECK_GT(bytes, 0, ValueError) << "Typhoon DMA bytes must be positive";
     TVM_FFI_CHECK_GE(sram_region_id, 0, ValueError)
         << "Typhoon DMA SRAM region id must be non-negative";
@@ -475,20 +481,43 @@ class TyphoonGraphVerifier : public StmtExprVisitor {
     };
 
     for (const auto& task : tasks_) {
+      if (task.kind == "dma") {
+        const auto& region =
+            task.reads.empty() ? regions_.at(task.writes[0]) : regions_.at(task.reads[0]);
+        TVM_FFI_CHECK_LE(task.sram_byte_offset + task.bytes, region.size, ValueError)
+            << "Typhoon DMA task " << task.task_id << " has out-of-bounds size mismatch";
+        continue;
+      }
       if (task.kind == "vector") {
         switch (task.op_code) {
           case 0:
           case 1: {
-            TVM_FFI_CHECK(task.metadata.empty(), ValueError)
-                << "Typhoon vector task " << task.task_id
-                << " does not accept metadata for add/relu";
             int64_t bytes = task.elem_count * DTypeBytes(task.dtype_code);
             TVM_FFI_CHECK_LE(bytes, regions_.at(task.reads[0]).size, ValueError)
                 << "Typhoon vector task " << task.task_id << " has out-of-bounds size mismatch";
-            if (task.op_code == 0) {
+            if (task.op_code == 0 && task.metadata.empty()) {
               TVM_FFI_CHECK_LE(bytes, regions_.at(task.reads[1]).size, ValueError)
                   << "Typhoon vector task " << task.task_id
                   << " has out-of-bounds size mismatch";
+            } else if (task.op_code == 0) {
+              TVM_FFI_CHECK_EQ(task.metadata.size(), 2U, ValueError)
+                  << "Typhoon vector broadcast-add task " << task.task_id
+                  << " expects [outer, inner] metadata";
+              int64_t outer = task.metadata[0];
+              int64_t inner = task.metadata[1];
+              expect_positive(outer, "outer", task);
+              expect_positive(inner, "inner", task);
+              TVM_FFI_CHECK_EQ(task.elem_count, outer * inner, ValueError)
+                  << "Typhoon vector broadcast-add task " << task.task_id
+                  << " has elem_count mismatch";
+              TVM_FFI_CHECK_LE(inner * DTypeBytes(task.dtype_code), regions_.at(task.reads[1]).size,
+                               ValueError)
+                  << "Typhoon vector task " << task.task_id
+                  << " has out-of-bounds size mismatch";
+            } else {
+              TVM_FFI_CHECK(task.metadata.empty(), ValueError)
+                  << "Typhoon vector task " << task.task_id
+                  << " does not accept metadata for relu";
             }
             TVM_FFI_CHECK_LE(bytes, regions_.at(task.writes[0]).size, ValueError)
                 << "Typhoon vector task " << task.task_id << " has out-of-bounds size mismatch";
@@ -585,9 +614,9 @@ class TyphoonGraphVerifier : public StmtExprVisitor {
                 << "Typhoon reshape task " << task.task_id << " has out-of-bounds size mismatch";
             break;
           case 1: {
-            TVM_FFI_CHECK_EQ(task.metadata.size(), 12U, ValueError)
+            TVM_FFI_CHECK(task.metadata.size() == 12U || task.metadata.size() == 16U, ValueError)
                 << "Typhoon reshape im2col task " << task.task_id
-                << " expects 12 metadata values";
+                << " expects 12 or 16 metadata values";
             int64_t n = task.metadata[0];
             int64_t c = task.metadata[1];
             int64_t in_h = task.metadata[2];
@@ -610,23 +639,51 @@ class TyphoonGraphVerifier : public StmtExprVisitor {
             expect_positive(stride_w, "stride_w", task);
             expect_non_negative(pad_h, "pad_h", task);
             expect_non_negative(pad_w, "pad_w", task);
-            int64_t numer_h = in_h + 2 * pad_h - kernel_h;
-            int64_t numer_w = in_w + 2 * pad_w - kernel_w;
-            TVM_FFI_CHECK_GE(numer_h, 0, ValueError)
-                << "Typhoon reshape im2col task " << task.task_id << " has invalid height";
-            TVM_FFI_CHECK_GE(numer_w, 0, ValueError)
-                << "Typhoon reshape im2col task " << task.task_id << " has invalid width";
-            TVM_FFI_CHECK_EQ(out_h, numer_h / stride_h + 1, ValueError)
-                << "Typhoon reshape im2col task " << task.task_id
-                << " has im2col output height mismatch";
-            TVM_FFI_CHECK_EQ(out_w, numer_w / stride_w + 1, ValueError)
-                << "Typhoon reshape im2col task " << task.task_id
-                << " has im2col output width mismatch";
+            bool tiled = task.metadata.size() == 16U;
+            if (!tiled) {
+              int64_t numer_h = in_h + 2 * pad_h - kernel_h;
+              int64_t numer_w = in_w + 2 * pad_w - kernel_w;
+              TVM_FFI_CHECK_GE(numer_h, 0, ValueError)
+                  << "Typhoon reshape im2col task " << task.task_id << " has invalid height";
+              TVM_FFI_CHECK_GE(numer_w, 0, ValueError)
+                  << "Typhoon reshape im2col task " << task.task_id << " has invalid width";
+              TVM_FFI_CHECK_EQ(out_h, numer_h / stride_h + 1, ValueError)
+                  << "Typhoon reshape im2col task " << task.task_id
+                  << " has im2col output height mismatch";
+              TVM_FFI_CHECK_EQ(out_w, numer_w / stride_w + 1, ValueError)
+                  << "Typhoon reshape im2col task " << task.task_id
+                  << " has im2col output width mismatch";
+            } else {
+              for (size_t i = 12; i < 16; ++i) {
+                TVM_FFI_CHECK_GE(task.metadata[i], 0, ValueError)
+                    << "Typhoon reshape im2col task " << task.task_id
+                    << " requires non-negative tile origins";
+              }
+              expect_positive(out_h, "out_h", task);
+              expect_positive(out_w, "out_w", task);
+            }
             TVM_FFI_CHECK_EQ(task.elem_count, n * c * kernel_h * kernel_w * out_h * out_w * 4,
                              ValueError)
                 << "Typhoon reshape im2col task " << task.task_id
                 << " has elem_count mismatch";
             TVM_FFI_CHECK_LE(n * c * in_h * in_w * 4, regions_.at(task.reads[0]).size, ValueError)
+                << "Typhoon reshape task " << task.task_id << " has out-of-bounds size mismatch";
+            TVM_FFI_CHECK_LE(task.elem_count, regions_.at(task.writes[0]).size, ValueError)
+                << "Typhoon reshape task " << task.task_id << " has out-of-bounds size mismatch";
+            break;
+          }
+          case 2: {
+            TVM_FFI_CHECK_EQ(task.metadata.size(), 2U, ValueError)
+                << "Typhoon reshape transpose task " << task.task_id
+                << " expects [rows, cols] metadata";
+            int64_t rows = task.metadata[0];
+            int64_t cols = task.metadata[1];
+            expect_positive(rows, "rows", task);
+            expect_positive(cols, "cols", task);
+            TVM_FFI_CHECK_EQ(task.elem_count, rows * cols * 4, ValueError)
+                << "Typhoon reshape transpose task " << task.task_id
+                << " has elem_count mismatch";
+            TVM_FFI_CHECK_LE(task.elem_count, regions_.at(task.reads[0]).size, ValueError)
                 << "Typhoon reshape task " << task.task_id << " has out-of-bounds size mismatch";
             TVM_FFI_CHECK_LE(task.elem_count, regions_.at(task.writes[0]).size, ValueError)
                 << "Typhoon reshape task " << task.task_id << " has out-of-bounds size mismatch";

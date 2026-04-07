@@ -66,12 +66,12 @@ def _maybe_build_typhoon_graph(mod, _ctx):
     if not typhoon_funcs:
         return mod
 
-    if len(typhoon_funcs) == 1:
-        try:
-            built = _run_typhoon_graph_build(mod)
-        except ValueError:
-            return mod
-        return mod if built is None else built
+    try:
+        built = _run_typhoon_graph_build(mod)
+    except ValueError:
+        built = None
+    if built is not None:
+        return built
 
     candidates = []
     for gvar, func in typhoon_funcs:

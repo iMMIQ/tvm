@@ -57,7 +57,7 @@ class TyphoonTaskDepLowerer : public StmtExprMutator {
     }
 
     if (call->op.same_as(task_dma_op_)) {
-      return LowerTask(call, /*num_deps_index=*/7, "TVMTyphoonAddDMATask", op->span);
+      return LowerTask(call, /*num_deps_index=*/8, "TVMTyphoonAddDMATask", op->span);
     }
     if (call->op.same_as(task_matmul_op_)) {
       return LowerTask(call, /*num_deps_index=*/10, "TVMTyphoonAddMatmulTask", op->span);

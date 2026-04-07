@@ -22,9 +22,17 @@ from collections.abc import Callable
 from typing import Any
 
 import tvm
+from tvm.contrib import cc as _cc
 from tvm.contrib import utils as _utils
 
 from . import Module, PackedFunc
+
+
+def _pick_c_compiler() -> str | None:
+    for candidate in ("clang", "gcc", "cc"):
+        if _cc.shutil.which(candidate):
+            return candidate
+    return None
 
 
 class Executable:
@@ -96,12 +104,22 @@ class Executable:
         def _not_runnable(x):
             return x.kind in ("c", "static_library")
 
+        def _is_c_source_module(x):
+            return x.kind == "c"
+
         # pylint:disable = protected-access
         not_runnable_list = self.mod._collect_from_import_tree(_not_runnable)
+        c_source_list = self.mod._collect_from_import_tree(_is_c_source_module)
 
         # everything is runnable, directly return mod.
         if len(not_runnable_list) == 0:
             return self.mod
+
+        if c_source_list and fcompile is None and "cc" not in kwargs:
+            cc_name = _pick_c_compiler()
+            if cc_name is not None:
+                fcompile = _cc.create_shared
+                kwargs["cc"] = cc_name
 
         # found source module, or other not runnable modules need to be export and load
         # TODO(tvm-team): Support runnable but not exportable module.

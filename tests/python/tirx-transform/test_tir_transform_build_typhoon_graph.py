@@ -18,6 +18,9 @@
 import json
 
 import tvm
+from tests.python.tirx_transform.typhoon_resnet18_test_utils import (
+    build_targeted_canonical_resnet18_tir_module,
+)
 
 
 def _make_stem_body(input_buffer, weight_buffer, output_buffer):
@@ -172,22 +175,39 @@ def test_build_typhoon_graph_emits_region_decl_and_tasks():
     assert "T.typhoon.submit_graph" in text
 
 
-def test_finalize_host_passes_auto_builds_typhoon_graph_for_resnet18_stem():
-    mod = build_resnet18_stem_tir_module()
+def test_finalize_host_passes_auto_builds_typhoon_graph_for_canonical_resnet18():
+    mod = build_targeted_canonical_resnet18_tir_module()
     out = tvm.tirx.pipeline.finalize_host_passes()(mod)
-    text = out.script()
     assert "typhoon_resnet18_plan" in out.attrs
     assert "typhoon_sram_plan" in out.attrs
-    assert "TVMTyphoonDeclareRegion" in text
-    assert "TVMTyphoonAddMatmulTask" in text
-    assert "TVMTyphoonGraphBegin" in text
-    assert "TVMTyphoonSubmitGraph" in text
+    for name in ["conv2d", "conv2d1", "conv2d4"]:
+        text = out[name].script()
+        assert "TVMTyphoonDeclareRegion" in text
+        assert "TVMTyphoonAddReshapeTask" in text
+        assert "TVMTyphoonAddMatmulTask" in text
+        assert "TVMTyphoonGraphBegin" in text
+        assert "TVMTyphoonSubmitGraph" in text
+        assert "TVMTyphoonWaitGraph" in text
 
 
-def test_finalize_host_passes_auto_builds_typhoon_graph_from_multifunc_module():
-    mod = build_multifunc_typhoon_module_with_stem()
+def test_finalize_host_passes_auto_builds_typhoon_graph_for_canonical_head_ops():
+    mod = build_targeted_canonical_resnet18_tir_module()
     out = tvm.tirx.pipeline.finalize_host_passes()(mod)
-    text = out.script()
     assert "typhoon_resnet18_plan" in out.attrs
     assert "typhoon_sram_plan" in out.attrs
-    assert "TVMTyphoonAddMatmulTask" in text
+    assert "TVMTyphoonAddVectorTask" in out["mean"].script()
+    assert "TVMTyphoonAddMatmulTask" in out["matmul"].script()
+    assert "TVMTyphoonGraphBegin" in out["matmul"].script()
+
+
+def test_build_typhoon_graph_graphizes_canonical_conv_primfuncs():
+    mod = build_targeted_canonical_resnet18_tir_module()
+    mod = tvm.tirx.transform.IdentifyTyphoonResNet18()(mod)
+    mod = tvm.tirx.transform.PlanTyphoonSRAM()(mod)
+    out = tvm.tirx.transform.BuildTyphoonGraph()(mod)
+
+    for name in ["conv2d", "conv2d1", "conv2d4"]:
+        text = out[name].script()
+        assert "T.typhoon.task_reshape" in text
+        assert "T.typhoon.task_matmul" in text
+        assert "T.typhoon.submit_graph" in text

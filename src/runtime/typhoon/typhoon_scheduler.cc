@@ -88,6 +88,17 @@ struct RunningTask {
   }
 };
 
+void AppendIntArrayJSON(std::ostringstream* os, const std::vector<int32_t>& values) {
+  *os << "[";
+  for (size_t i = 0; i < values.size(); ++i) {
+    if (i != 0) {
+      *os << ",";
+    }
+    *os << values[i];
+  }
+  *os << "]";
+}
+
 }  // namespace
 
 TyphoonScheduler::TyphoonScheduler(TyphoonHWConfig hw) : hw_(std::move(hw)) {}
@@ -157,7 +168,9 @@ std::vector<TyphoonTraceRecord> TyphoonScheduler::Run(const TyphoonGraphBuilder&
                        now,
                        finish_time,
                        EstimateSramBytesRead(task),
-                       EstimateSramBytesWritten(task)});
+                       EstimateSramBytesWritten(task),
+                       task.reads,
+                       task.writes});
     }
   };
 
@@ -212,7 +225,12 @@ std::string SerializeTraceToJSON(const std::vector<TyphoonTraceRecord>& trace) {
        << "\"start_time\":" << record.start_time << ","
        << "\"end_time\":" << record.end_time << ","
        << "\"sram_bytes_read\":" << record.sram_bytes_read << ","
-       << "\"sram_bytes_written\":" << record.sram_bytes_written << "}";
+       << "\"sram_bytes_written\":" << record.sram_bytes_written << ","
+       << "\"region_reads\":";
+    AppendIntArrayJSON(&os, record.region_reads);
+    os << ",\"region_writes\":";
+    AppendIntArrayJSON(&os, record.region_writes);
+    os << "}";
   }
   os << "]";
   return os.str();

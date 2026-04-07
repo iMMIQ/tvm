@@ -18,6 +18,7 @@
 
 import os
 import tempfile
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -25,6 +26,12 @@ import tvm
 import tvm.testing
 from tvm.runtime import Executable
 from tvm.script import tirx as T
+
+
+def _host_target_for_tests():
+    if tvm.get_global_func("target.build.llvm", allow_missing=True) is not None:
+        return "llvm"
+    return "c"
 
 
 @tvm.script.ir_module
@@ -41,7 +48,7 @@ class MyModule:
 
 def test_executable_init():
     """Test initialization of Executable class."""
-    lib = tvm.tirx.build(MyModule, target="llvm")
+    lib = tvm.tirx.build(MyModule, target=_host_target_for_tests())
     executable = Executable(lib)
 
     assert executable.mod is lib
@@ -50,7 +57,7 @@ def test_executable_init():
 
 def test_executable_getitem():
     """Test __getitem__ method of Executable class."""
-    lib = tvm.tirx.build(MyModule, target="llvm")
+    lib = tvm.tirx.build(MyModule, target=_host_target_for_tests())
     executable = Executable(lib)
 
     # Jit the module first
@@ -72,7 +79,7 @@ def test_executable_getitem():
 
 def test_executable_jit_already_jitted():
     """Test jit method when module is already jitted."""
-    lib = tvm.tirx.build(MyModule, target="llvm")
+    lib = tvm.tirx.build(MyModule, target=_host_target_for_tests())
     executable = Executable(lib)
 
     # First jit call
@@ -101,7 +108,7 @@ def test_executable_jit_already_jitted():
 
 def test_executable_export_library():
     """Test export_library method."""
-    lib = tvm.tirx.build(MyModule, target="llvm")
+    lib = tvm.tirx.build(MyModule, target=_host_target_for_tests())
     executable = Executable(lib)
 
     # Create a temporary directory for the library
@@ -136,7 +143,7 @@ def test_executable_export_library():
 
 def test_executable_export_library_with_workspace():
     """Test export_library method with workspace_dir."""
-    lib = tvm.tirx.build(MyModule, target="llvm")
+    lib = tvm.tirx.build(MyModule, target=_host_target_for_tests())
     executable = Executable(lib)
 
     # Create temporary directories
@@ -175,7 +182,7 @@ def test_executable_export_library_with_workspace():
 def test_executable_integration():
     """Integration test for Executable with a simple TVM module."""
     # Create target and build
-    target = tvm.target.Target("llvm")
+    target = tvm.target.Target(_host_target_for_tests())
     lib = tvm.tirx.build(MyModule, target=target)
 
     # Create an executable
@@ -257,6 +264,28 @@ def test_executable_jit_force_recompile():
 
     # Check results
     tvm.testing.assert_allclose(c.numpy(), np.array([3.0] * 10, dtype="float32"))
+
+
+def test_executable_jit_prefers_c_compiler_for_c_source(monkeypatch):
+    calls = {}
+
+    class FakeMod:
+        def _collect_from_import_tree(self, filter_func):
+            mod = SimpleNamespace(kind="c")
+            return [mod] if filter_func(mod) else []
+
+        def export_library(self, file_name, **kwargs):
+            calls["file_name"] = file_name
+            calls.update(kwargs)
+
+    monkeypatch.setattr("tvm.runtime.executable.tvm.runtime.load_module", lambda path: "loaded")
+
+    executable = Executable(FakeMod())
+    jitted = executable.jit()
+
+    assert jitted == "loaded"
+    assert calls["fcompile"] is tvm.contrib.cc.create_shared
+    assert calls["cc"] in ("clang", "gcc", "cc")
 
 
 if __name__ == "__main__":

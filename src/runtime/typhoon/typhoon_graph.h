@@ -41,8 +41,9 @@ class TyphoonGraphBuilder {
   void DeclareRegion(int32_t region_id, int64_t offset, int64_t size, int64_t alignment,
                      bool preinitialized, const char* tag);
   void AddDMATask(int32_t task_id, int32_t direction, void* global_handle,
-                  int64_t global_byte_offset, int32_t sram_region_id, int64_t bytes,
-                  int32_t num_deps, const int32_t* dep_ids);
+                  int64_t global_byte_offset, int32_t sram_region_id,
+                  int64_t sram_byte_offset, int64_t bytes, int32_t num_deps,
+                  const int32_t* dep_ids);
   void AddMatmulTask(int32_t task_id, int32_t a_region_id, int32_t b_region_id,
                      int32_t c_region_id, int64_t m, int64_t n, int64_t k, int32_t dtype_code,
                      int32_t layout_code, int32_t num_deps, const int32_t* dep_ids);
@@ -60,6 +61,8 @@ class TyphoonGraphBuilder {
   const std::vector<TyphoonRegion>& regions() const { return regions_; }
   const std::vector<TyphoonTask>& tasks() const { return tasks_; }
   const std::unordered_map<int32_t, size_t>& task_index() const { return task_index_; }
+  const TyphoonRegion& GetRegion(int32_t region_id) const;
+  const std::vector<size_t>& topo_order() const { return topo_order_; }
 
  private:
   std::vector<int32_t> CopyDeps(int32_t num_deps, const int32_t* dep_ids) const;
@@ -72,10 +75,8 @@ class TyphoonGraphBuilder {
   void ValidateTaskInitialization() const;
   void ValidateWriteHazards() const;
   void ValidateTaskFootprints() const;
-  const TyphoonRegion& GetRegion(int32_t region_id) const;
   int64_t DTypeBytes(int32_t dtype_code) const;
   const std::unordered_set<int32_t>& BuildAncestors(size_t task_index);
-  void DetectCycle(size_t task_index, std::vector<int>* state) const;
 
   int32_t graph_id_;
   bool began_{false};
@@ -85,6 +86,7 @@ class TyphoonGraphBuilder {
   std::unordered_map<int32_t, size_t> region_index_;
   std::unordered_map<int32_t, size_t> task_index_;
   std::vector<std::vector<size_t>> reverse_edges_;
+  std::vector<size_t> topo_order_;
   std::vector<std::unordered_set<int32_t>> ancestors_;
   std::vector<bool> ancestor_built_;
 };

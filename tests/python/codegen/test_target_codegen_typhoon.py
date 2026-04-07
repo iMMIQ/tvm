@@ -16,6 +16,7 @@
 # under the License.
 
 import json
+import re
 
 import numpy as np
 import pytest
@@ -23,6 +24,14 @@ import pytest
 import tvm
 import tvm.testing
 from tvm.runtime import Executable
+from tests.python.tirx_transform.typhoon_resnet18_test_utils import (
+    build_targeted_canonical_resnet18_tir_module,
+)
+
+
+_FFI_DEF_RE = re.compile(
+    r"__tvm_ffi_([A-Za-z0-9_]+)\(void\* self_handle, void\* args, int32_t num_args, void\* result\) \{"
+)
 
 
 def _reset_typhoon_runtime():
@@ -41,6 +50,27 @@ def _jit_module(mod):
     _reset_typhoon_runtime()
     lib = tvm.tirx.build(mod, target={"kind": "typhoon"})
     return Executable(lib).jit()
+
+
+def _inspect_source(mod):
+    return tvm.tirx.build(mod, target={"kind": "typhoon"}).inspect_source()
+
+
+def _extract_ffi_function_bodies(source):
+    matches = list(_FFI_DEF_RE.finditer(source))
+    return {
+        match.group(1): source[match.start() : matches[index + 1].start() if index + 1 < len(matches) else len(source)]
+        for index, match in enumerate(matches)
+    }
+
+
+def _assert_graphized_function_has_no_host_fallback(body, *required_markers):
+    assert "TVMTyphoonGraphBegin" in body
+    assert "TVMTyphoonSubmitGraph" in body
+    assert "TVMTyphoonWaitGraph" in body
+    for marker in required_markers:
+        assert marker in body
+    assert "for (" not in body
 
 
 def _tensor(array):
@@ -164,6 +194,46 @@ def test_typhoon_mixed_reshape_vector_matmul_roundtrip():
 
     expected = (lhs + rhs).reshape(2, 2) @ mat_rhs
     tvm.testing.assert_allclose(out.numpy(), expected)
+
+
+def test_typhoon_graph_entry_codegen_has_no_host_fallback_loops():
+    source = _inspect_source(_build_mixed_module())
+    main_body = _extract_ffi_function_bodies(source)["main"]
+    _assert_graphized_function_has_no_host_fallback(
+        main_body,
+        "TVMTyphoonAddReshapeTask",
+        "TVMTyphoonAddMatmulTask",
+    )
+
+
+def test_typhoon_codegen_emits_dma_decl_with_bytes_parameter():
+    source = _inspect_source(_build_mixed_module())
+    assert (
+        "int32_t TVMTyphoonAddDMATask(int32_t, int32_t, int32_t, void*, int64_t, "
+        "int32_t, int64_t, int64_t, int32_t, void*)"
+    ) in source
+
+
+def test_typhoon_resnet18_graphized_conv_codegen_stays_graph_only():
+    mod = build_targeted_canonical_resnet18_tir_module()
+    mod = tvm.tirx.transform.IdentifyTyphoonResNet18()(mod)
+    mod = tvm.tirx.transform.PlanTyphoonSRAM()(mod)
+    mod = tvm.tirx.transform.BuildTyphoonGraph()(mod)
+
+    for name in ["conv2d", "conv2d1", "conv2d4"]:
+        text = mod[name].script()
+        assert "T.typhoon.task_reshape" in text
+        assert "T.typhoon.task_matmul" in text
+
+    ffi_bodies = _extract_ffi_function_bodies(_inspect_source(mod))
+    for name in ["conv2d", "conv2d1", "conv2d4"]:
+        body = ffi_bodies[name]
+        if "TVMTyphoonGraphBegin" in body:
+            _assert_graphized_function_has_no_host_fallback(
+                body,
+                "TVMTyphoonAddReshapeTask",
+                "TVMTyphoonAddMatmulTask",
+            )
 
 
 def test_typhoon_invalid_sram_usage_raises_clear_error():

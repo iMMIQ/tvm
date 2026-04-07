@@ -216,6 +216,12 @@ def build(
     # Step 3: Bind the target to the input module
     mod = tvm.tirx.transform.BindTarget(target_to_bind)(mod)
 
+    # Typhoon graph recognition must run before the generic TIR lowering pipeline.
+    # After MakePackedAPI and related lowering, the fixed-shape ResNet18 stem pattern
+    # is no longer matchable, so the helper graph would never be emitted.
+    if target is not None and target.kind.name == "typhoon":
+        mod = tvm.tirx.pipeline._maybe_build_typhoon_graph(mod)
+
     # Step 4: Apply the tirx pipeline
     if pipeline is not None:
         # custom pipeline

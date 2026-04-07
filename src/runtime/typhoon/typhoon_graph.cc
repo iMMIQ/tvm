@@ -20,6 +20,7 @@
 #include "typhoon_graph.h"
 
 #include <algorithm>
+#include <queue>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -86,13 +87,15 @@ void TyphoonGraphBuilder::DeclareRegion(int32_t region_id, int64_t offset, int64
 
 void TyphoonGraphBuilder::AddDMATask(int32_t task_id, int32_t direction, void* global_handle,
                                      int64_t global_byte_offset, int32_t sram_region_id,
-                                     int64_t bytes, int32_t num_deps, const int32_t* dep_ids) {
+                                     int64_t sram_byte_offset, int64_t bytes, int32_t num_deps,
+                                     const int32_t* dep_ids) {
   TyphoonTask task;
   task.kind = TaskKind::kDMA;
   task.task_id = task_id;
   task.deps = CopyDeps(num_deps, dep_ids);
   task.global_endpoint = {global_handle, global_byte_offset};
   task.direction = direction;
+  task.sram_byte_offset = sram_byte_offset;
   task.bytes = bytes;
   if (direction == 0) {
     task.writes = {sram_region_id};
@@ -118,7 +121,7 @@ void TyphoonGraphBuilder::AddMatmulTask(int32_t task_id, int32_t a_region_id, in
   task.n = n;
   task.k = k;
   task.dtype_code = dtype_code;
-  (void)layout_code;
+  task.layout_code = layout_code;
   AddTask(std::move(task));
 }
 
@@ -268,7 +271,10 @@ void TyphoonGraphBuilder::ValidateTaskRegions() const {
 
 void TyphoonGraphBuilder::ValidateTaskDependencies() {
   reverse_edges_.assign(tasks_.size(), {});
+  std::vector<std::vector<size_t>> users(tasks_.size());
+  std::vector<int> indegree(tasks_.size(), 0);
   for (size_t i = 0; i < tasks_.size(); ++i) {
+    indegree[i] = static_cast<int>(tasks_[i].deps.size());
     for (int32_t dep_id : tasks_[i].deps) {
       auto it = task_index_.find(dep_id);
       if (it == task_index_.end()) {
@@ -276,17 +282,43 @@ void TyphoonGraphBuilder::ValidateTaskDependencies() {
                      " references unknown task dependency " + std::to_string(dep_id));
       }
       reverse_edges_[i].push_back(it->second);
+      users[it->second].push_back(i);
     }
   }
 
-  std::vector<int> state(tasks_.size(), 0);
+  auto ready_cmp = [this](size_t lhs, size_t rhs) {
+    if (tasks_[lhs].task_id != tasks_[rhs].task_id) {
+      return tasks_[lhs].task_id > tasks_[rhs].task_id;
+    }
+    return lhs > rhs;
+  };
+  std::priority_queue<size_t, std::vector<size_t>, decltype(ready_cmp)> ready(ready_cmp);
   for (size_t i = 0; i < tasks_.size(); ++i) {
-    DetectCycle(i, &state);
+    if (indegree[i] == 0) {
+      ready.push(i);
+    }
+  }
+
+  topo_order_.clear();
+  topo_order_.reserve(tasks_.size());
+  while (!ready.empty()) {
+    size_t current = ready.top();
+    ready.pop();
+    topo_order_.push_back(current);
+    for (size_t user : users[current]) {
+      --indegree[user];
+      if (indegree[user] == 0) {
+        ready.push(user);
+      }
+    }
+  }
+  if (topo_order_.size() != tasks_.size()) {
+    TyphoonError("Typhoon dependency cycle detected");
   }
 
   ancestors_.assign(tasks_.size(), {});
   ancestor_built_.assign(tasks_.size(), false);
-  for (size_t i = 0; i < tasks_.size(); ++i) {
+  for (size_t i : topo_order_) {
     BuildAncestors(i);
   }
 }
@@ -327,26 +359,17 @@ void TyphoonGraphBuilder::ValidateTaskInitialization() const {
 }
 
 void TyphoonGraphBuilder::ValidateWriteHazards() const {
-  std::unordered_map<int32_t, std::vector<int32_t>> writers_by_region;
-  for (const auto& task : tasks_) {
+  std::unordered_map<int32_t, int32_t> last_writer_by_region;
+  for (size_t task_index : topo_order_) {
+    const auto& task = tasks_[task_index];
     for (int32_t region_id : task.writes) {
-      writers_by_region[region_id].push_back(task.task_id);
-    }
-  }
-
-  for (const auto& [region_id, writers] : writers_by_region) {
-    for (size_t i = 0; i < writers.size(); ++i) {
-      for (size_t j = i + 1; j < writers.size(); ++j) {
-        size_t lhs = task_index_.at(writers[i]);
-        size_t rhs = task_index_.at(writers[j]);
-        bool ordered =
-            ancestors_[lhs].count(writers[j]) || ancestors_[rhs].count(writers[i]);
-        if (!ordered) {
-          TyphoonError("Typhoon write hazard on region " + std::to_string(region_id) +
-                       " between task " + std::to_string(writers[i]) + " and task " +
-                       std::to_string(writers[j]));
-        }
+      auto it = last_writer_by_region.find(region_id);
+      if (it != last_writer_by_region.end() && !ancestors_[task_index].count(it->second)) {
+        TyphoonError("Typhoon write hazard on region " + std::to_string(region_id) +
+                     " between task " + std::to_string(it->second) + " and task " +
+                     std::to_string(task.task_id));
       }
+      last_writer_by_region[region_id] = task.task_id;
     }
   }
 }
@@ -355,7 +378,8 @@ void TyphoonGraphBuilder::ValidateTaskFootprints() const {
   for (const auto& task : tasks_) {
     if (task.kind == TaskKind::kDMA) {
       const auto& region = task.direction == 0 ? GetRegion(task.writes.at(0)) : GetRegion(task.reads.at(0));
-      if (task.bytes > region.size) {
+      if (task.sram_byte_offset < 0 || task.bytes <= 0 ||
+          task.sram_byte_offset + task.bytes > region.size) {
         TyphoonError("Typhoon DMA task " + std::to_string(task.task_id) +
                      " has out-of-bounds size mismatch");
       }
@@ -371,14 +395,27 @@ void TyphoonGraphBuilder::ValidateTaskFootprints() const {
 
       switch (task.op_code) {
         case 0: {
-          if (!task.metadata.empty()) {
-            TyphoonError(task_prefix + " add does not accept metadata");
-          }
           int64_t bytes = task.elem_count * DTypeBytes(task.dtype_code);
           input_bytes = bytes;
           output_bytes = bytes;
-          if (bytes > GetRegion(task.reads.at(1)).size) {
-            TyphoonError(task_prefix + " has out-of-bounds size mismatch");
+          if (task.metadata.empty()) {
+            if (bytes > GetRegion(task.reads.at(1)).size) {
+              TyphoonError(task_prefix + " has out-of-bounds size mismatch");
+            }
+          } else if (task.metadata.size() == 2) {
+            int64_t outer = RequireMetadataValue(task.metadata, 0, task_prefix);
+            int64_t inner = RequireMetadataValue(task.metadata, 1, task_prefix);
+            if (outer <= 0 || inner <= 0) {
+              TyphoonError(task_prefix + " broadcast add metadata values must be positive");
+            }
+            if (task.elem_count != outer * inner) {
+              TyphoonError(task_prefix + " broadcast add elem_count does not match metadata");
+            }
+            if (inner * DTypeBytes(task.dtype_code) > GetRegion(task.reads.at(1)).size) {
+              TyphoonError(task_prefix + " has out-of-bounds size mismatch");
+            }
+          } else {
+            TyphoonError(task_prefix + " add metadata must be empty or [outer, inner]");
           }
           break;
         }
@@ -468,8 +505,8 @@ void TyphoonGraphBuilder::ValidateTaskFootprints() const {
           output_bytes = task.elem_count;
           break;
         case 1: {
-          if (task.metadata.size() != 12) {
-            TyphoonError(task_prefix + " im2col metadata must have 12 values");
+          if (task.metadata.size() != 12 && task.metadata.size() != 16) {
+            TyphoonError(task_prefix + " im2col metadata must have 12 or 16 values");
           }
           int64_t n = RequireMetadataValue(task.metadata, 0, task_prefix);
           int64_t c = RequireMetadataValue(task.metadata, 1, task_prefix);
@@ -483,14 +520,44 @@ void TyphoonGraphBuilder::ValidateTaskFootprints() const {
           int64_t pad_w = RequireMetadataValue(task.metadata, 9, task_prefix);
           int64_t out_h = RequireMetadataValue(task.metadata, 10, task_prefix);
           int64_t out_w = RequireMetadataValue(task.metadata, 11, task_prefix);
-          if (out_h != ComputePoolOutputExtent(in_h, kernel_h, stride_h, pad_h, task_prefix + " im2col") ||
-              out_w != ComputePoolOutputExtent(in_w, kernel_w, stride_w, pad_w, task_prefix + " im2col")) {
+          bool tiled = task.metadata.size() == 16;
+          if (!tiled &&
+              (out_h != ComputePoolOutputExtent(in_h, kernel_h, stride_h, pad_h, task_prefix + " im2col") ||
+               out_w != ComputePoolOutputExtent(in_w, kernel_w, stride_w, pad_w, task_prefix + " im2col"))) {
             TyphoonError(task_prefix + " im2col metadata shape mismatch");
+          }
+          if (tiled) {
+            int64_t input_origin_h = RequireMetadataValue(task.metadata, 12, task_prefix);
+            int64_t input_origin_w = RequireMetadataValue(task.metadata, 13, task_prefix);
+            int64_t output_origin_h = RequireMetadataValue(task.metadata, 14, task_prefix);
+            int64_t output_origin_w = RequireMetadataValue(task.metadata, 15, task_prefix);
+            if (input_origin_h < 0 || input_origin_w < 0 || output_origin_h < 0 || output_origin_w < 0) {
+              TyphoonError(task_prefix + " tiled im2col origins must be non-negative");
+            }
+            if (out_h <= 0 || out_w <= 0) {
+              TyphoonError(task_prefix + " tiled im2col tile shape must be positive");
+            }
           }
           input_bytes = n * c * in_h * in_w * 4;
           output_bytes = n * out_h * out_w * c * kernel_h * kernel_w * 4;
           if (task.elem_count != output_bytes) {
             TyphoonError(task_prefix + " im2col elem_count does not match metadata");
+          }
+          break;
+        }
+        case 2: {
+          if (task.metadata.size() != 2) {
+            TyphoonError(task_prefix + " transpose metadata must have 2 values");
+          }
+          int64_t rows = RequireMetadataValue(task.metadata, 0, task_prefix);
+          int64_t cols = RequireMetadataValue(task.metadata, 1, task_prefix);
+          if (rows <= 0 || cols <= 0) {
+            TyphoonError(task_prefix + " transpose metadata values must be positive");
+          }
+          input_bytes = rows * cols * 4;
+          output_bytes = rows * cols * 4;
+          if (task.elem_count != output_bytes) {
+            TyphoonError(task_prefix + " transpose elem_count does not match metadata");
           }
           break;
         }
@@ -552,21 +619,6 @@ const std::unordered_set<int32_t>& TyphoonGraphBuilder::BuildAncestors(size_t ta
   }
   ancestor_built_[task_index] = true;
   return ancestors;
-}
-
-void TyphoonGraphBuilder::DetectCycle(size_t task_index, std::vector<int>* state) const {
-  if ((*state)[task_index] == 2) {
-    return;
-  }
-  if ((*state)[task_index] == 1) {
-    TyphoonError("Typhoon dependency cycle detected at task " +
-                 std::to_string(tasks_[task_index].task_id));
-  }
-  (*state)[task_index] = 1;
-  for (size_t dep_index : reverse_edges_[task_index]) {
-    DetectCycle(dep_index, state);
-  }
-  (*state)[task_index] = 2;
 }
 
 }  // namespace typhoon
