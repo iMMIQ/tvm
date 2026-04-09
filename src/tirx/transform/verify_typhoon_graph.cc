@@ -33,9 +33,9 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <queue>
 #include <string>
 #include <unordered_map>
-#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -46,6 +46,7 @@ namespace {
 
 struct TyphoonRegionInfo {
   int64_t region_id;
+  std::string name;
   int64_t offset;
   int64_t size;
   int64_t alignment;
@@ -71,13 +72,19 @@ class TyphoonGraphVerifier : public StmtExprVisitor {
  public:
   explicit TyphoonGraphVerifier(int64_t sram_size) : sram_size_(sram_size) {}
 
-  void Verify(const PrimFunc& func) {
-    VisitStmt(func->body);
+  void Consume(const PrimFunc& func) { VisitStmt(func->body); }
+
+  void Finish() {
     VerifyTaskRegions();
     VerifyDependencies();
     VerifyInitialization();
     VerifyWriteHazards();
     VerifyTaskPayloads();
+  }
+
+  void Verify(const PrimFunc& func) {
+    Consume(func);
+    Finish();
   }
 
  private:
@@ -201,6 +208,8 @@ class TyphoonGraphVerifier : public StmtExprVisitor {
     int64_t size = ExpectInt(call->args[3], "size");
     int64_t alignment = ExpectInt(call->args[4], "alignment");
     int64_t preinitialized = ExpectInt(call->args[5], "preinitialized");
+    const auto* name = call->args[6].as<StringImmNode>();
+    TVM_FFI_CHECK(name != nullptr, ValueError) << "Typhoon region_decl expects string tag";
 
     TVM_FFI_CHECK_GE(region_id, 0, ValueError) << "Typhoon region_id must be non-negative";
     TVM_FFI_CHECK_GE(offset, 0, ValueError) << "Typhoon region offset must be non-negative";
@@ -210,8 +219,18 @@ class TyphoonGraphVerifier : public StmtExprVisitor {
         << "Typhoon region " << region_id << " offset does not satisfy alignment";
     TVM_FFI_CHECK_LE(offset + size, sram_size_, ValueError)
         << "Typhoon region " << region_id << " exceeds SRAM bounds";
-    TVM_FFI_CHECK(!regions_.count(region_id), ValueError)
-        << "Typhoon graph has duplicate region_id " << region_id;
+    auto it = regions_.find(region_id);
+    if (it != regions_.end()) {
+      const auto& existing = it->second;
+      TVM_FFI_CHECK(existing.offset == offset && existing.size == size &&
+                        existing.alignment == alignment &&
+                        existing.preinitialized == (preinitialized != 0) &&
+                        existing.name == name->value,
+                    ValueError)
+          << "Typhoon graph has duplicate region_id " << region_id
+          << " with mismatched declaration";
+      return;
+    }
 
     for (const auto& [other_id, other] : regions_) {
       bool overlap = std::max(offset, other.offset) < std::min(offset + size, other.offset + other.size);
@@ -219,8 +238,8 @@ class TyphoonGraphVerifier : public StmtExprVisitor {
           << "Typhoon regions " << other_id << " and " << region_id << " overlap";
     }
 
-    regions_.emplace(region_id,
-                     TyphoonRegionInfo{region_id, offset, size, alignment, preinitialized != 0});
+    regions_.emplace(region_id, TyphoonRegionInfo{region_id, name->value, offset, size, alignment,
+                                                  preinitialized != 0});
   }
 
   void CollectDMATask(const CallNode* call) {
@@ -358,6 +377,7 @@ class TyphoonGraphVerifier : public StmtExprVisitor {
   void VerifyDependencies() {
     forward_edges_.assign(tasks_.size(), {});
     reverse_edges_.assign(tasks_.size(), {});
+    topo_order_.clear();
 
     for (size_t i = 0; i < tasks_.size(); ++i) {
       for (int64_t dep_id : tasks_[i].deps) {
@@ -370,53 +390,63 @@ class TyphoonGraphVerifier : public StmtExprVisitor {
       }
     }
 
-    std::vector<int> state(tasks_.size(), 0);
+    std::vector<int64_t> indegree(tasks_.size(), 0);
     for (size_t i = 0; i < tasks_.size(); ++i) {
-      DetectCycle(i, &state);
+      indegree[i] = reverse_edges_[i].size();
     }
 
-    ancestors_.assign(tasks_.size(), {});
-    ancestor_built_.assign(tasks_.size(), false);
+    std::queue<size_t> ready;
     for (size_t i = 0; i < tasks_.size(); ++i) {
-      BuildAncestors(i);
+      if (indegree[i] == 0) {
+        ready.push(i);
+      }
+    }
+
+    topo_order_.reserve(tasks_.size());
+    while (!ready.empty()) {
+      size_t index = ready.front();
+      ready.pop();
+      topo_order_.push_back(index);
+      for (size_t next : forward_edges_[index]) {
+        --indegree[next];
+        if (indegree[next] == 0) {
+          ready.push(next);
+        }
+      }
+    }
+
+    TVM_FFI_CHECK_EQ(topo_order_.size(), tasks_.size(), ValueError)
+        << "Typhoon task dependency cycle detected";
+
+    topo_position_.assign(tasks_.size(), 0);
+    for (size_t i = 0; i < topo_order_.size(); ++i) {
+      topo_position_[topo_order_[i]] = i;
+    }
+
+    int64_t num_words = (static_cast<int64_t>(tasks_.size()) + 63) / 64;
+    ancestor_bits_.assign(tasks_.size(), std::vector<uint64_t>(num_words, 0));
+    for (size_t index : topo_order_) {
+      auto& bits = ancestor_bits_[index];
+      for (size_t dep_index : reverse_edges_[index]) {
+        const auto& dep_bits = ancestor_bits_[dep_index];
+        for (int64_t word = 0; word < num_words; ++word) {
+          bits[word] |= dep_bits[word];
+        }
+        bits[dep_index / 64] |= (uint64_t{1} << (dep_index % 64));
+      }
     }
   }
 
-  void DetectCycle(size_t index, std::vector<int>* state) const {
-    if ((*state)[index] == 2) {
-      return;
-    }
-    TVM_FFI_CHECK_NE((*state)[index], 1, ValueError)
-        << "Typhoon task dependency cycle detected at task_id " << tasks_[index].task_id;
-
-    (*state)[index] = 1;
-    for (size_t dep_index : reverse_edges_[index]) {
-      DetectCycle(dep_index, state);
-    }
-    (*state)[index] = 2;
-  }
-
-  const std::unordered_set<int64_t>& BuildAncestors(size_t index) {
-    if (ancestor_built_[index]) {
-      return ancestors_[index];
-    }
-
-    auto& ancestors = ancestors_[index];
-    for (size_t dep_index : reverse_edges_[index]) {
-      int64_t dep_task_id = tasks_[dep_index].task_id;
-      ancestors.insert(dep_task_id);
-      const auto& dep_ancestors = BuildAncestors(dep_index);
-      ancestors.insert(dep_ancestors.begin(), dep_ancestors.end());
-    }
-    ancestor_built_[index] = true;
-    return ancestors;
+  bool IsAncestor(size_t index, size_t maybe_ancestor) const {
+    return (ancestor_bits_[index][maybe_ancestor / 64] >> (maybe_ancestor % 64)) & uint64_t{1};
   }
 
   void VerifyInitialization() const {
-    std::unordered_map<int64_t, std::vector<int64_t>> writers_by_region;
-    for (const auto& task : tasks_) {
+    std::unordered_map<int64_t, std::vector<size_t>> writers_by_region;
+    for (size_t task_index = 0; task_index < tasks_.size(); ++task_index) {
+      const auto& task = tasks_[task_index];
       for (int64_t region_id : task.writes) {
-        writers_by_region[region_id].push_back(task.task_id);
+        writers_by_region[region_id].push_back(task_index);
       }
     }
 
@@ -431,8 +461,8 @@ class TyphoonGraphVerifier : public StmtExprVisitor {
         bool initialized = false;
         auto it = writers_by_region.find(region_id);
         if (it != writers_by_region.end()) {
-          for (int64_t writer_task_id : it->second) {
-            if (ancestors_[i].count(writer_task_id)) {
+          for (size_t writer_index : it->second) {
+            if (IsAncestor(i, writer_index)) {
               initialized = true;
               break;
             }
@@ -447,23 +477,27 @@ class TyphoonGraphVerifier : public StmtExprVisitor {
   }
 
   void VerifyWriteHazards() const {
-    std::unordered_map<int64_t, std::vector<int64_t>> writers_by_region;
-    for (const auto& task : tasks_) {
+    std::unordered_map<int64_t, std::vector<size_t>> writers_by_region;
+    for (size_t task_index = 0; task_index < tasks_.size(); ++task_index) {
+      const auto& task = tasks_[task_index];
       for (int64_t region_id : task.writes) {
-        writers_by_region[region_id].push_back(task.task_id);
+        writers_by_region[region_id].push_back(task_index);
       }
     }
 
     for (const auto& [region_id, writers] : writers_by_region) {
-      for (size_t i = 0; i < writers.size(); ++i) {
-        for (size_t j = i + 1; j < writers.size(); ++j) {
-          size_t lhs_index = task_id_to_index_.at(writers[i]);
-          size_t rhs_index = task_id_to_index_.at(writers[j]);
-          bool ordered = ancestors_[lhs_index].count(writers[j]) || ancestors_[rhs_index].count(writers[i]);
-          TVM_FFI_CHECK(ordered, ValueError)
-              << "Typhoon write hazard on region " << region_id << " between task "
-              << writers[i] << " and task " << writers[j];
-        }
+      if (writers.size() < 2) {
+        continue;
+      }
+      std::vector<size_t> ordered_writers = writers;
+      std::sort(ordered_writers.begin(), ordered_writers.end(),
+                [this](size_t lhs, size_t rhs) { return topo_position_[lhs] < topo_position_[rhs]; });
+      for (size_t i = 1; i < ordered_writers.size(); ++i) {
+        size_t prev = ordered_writers[i - 1];
+        size_t curr = ordered_writers[i];
+        TVM_FFI_CHECK(IsAncestor(curr, prev), ValueError)
+            << "Typhoon write hazard on region " << region_id << " between task "
+            << tasks_[prev].task_id << " and task " << tasks_[curr].task_id;
       }
     }
   }
@@ -704,8 +738,9 @@ class TyphoonGraphVerifier : public StmtExprVisitor {
   std::unordered_map<int64_t, size_t> task_id_to_index_;
   std::vector<std::vector<size_t>> forward_edges_;
   std::vector<std::vector<size_t>> reverse_edges_;
-  std::vector<std::unordered_set<int64_t>> ancestors_;
-  std::vector<bool> ancestor_built_;
+  std::vector<size_t> topo_order_;
+  std::vector<size_t> topo_position_;
+  std::vector<std::vector<uint64_t>> ancestor_bits_;
 
   const Op& region_decl_op_ = Op::Get("tirx.typhoon.region_decl");
   const Op& submit_graph_op_ = Op::Get("tirx.typhoon.submit_graph");
@@ -740,6 +775,22 @@ namespace transform {
 
 Pass VerifyTyphoonGraph() {
   auto pass_func = [](IRModule mod, PassContext ctx) {
+    struct SubmitGraphCounter : public StmtVisitor {
+      int count{0};
+      const Op& submit_graph_op = Op::Get("tirx.typhoon.submit_graph");
+
+      void VisitStmt_(const EvaluateNode* op) final {
+        const auto* call = op->value.as<CallNode>();
+        if (call != nullptr && call->op.same_as(submit_graph_op)) {
+          ++count;
+        }
+        StmtVisitor::VisitStmt_(op);
+      }
+    };
+
+    std::vector<PrimFunc> typhoon_funcs;
+    int64_t whole_graph_submit_count = 0;
+    int64_t whole_graph_sram_size = -1;
     for (const auto& [gvar, base_func] : mod->functions) {
       const auto* func = base_func.as<PrimFuncNode>();
       if (func == nullptr) {
@@ -751,8 +802,37 @@ Pass VerifyTyphoonGraph() {
         continue;
       }
 
-      int64_t sram_size = target.value()->GetAttr<Integer>("sram_size", Integer(1048576)).value().IntValue();
-      TyphoonGraphVerifier(sram_size).Verify(ffi::GetRef<PrimFunc>(func));
+      PrimFunc prim_func = ffi::GetRef<PrimFunc>(func);
+      typhoon_funcs.push_back(prim_func);
+      if (whole_graph_sram_size < 0) {
+        whole_graph_sram_size =
+            target.value()->GetAttr<Integer>("sram_size", Integer(1048576)).value().IntValue();
+      }
+      SubmitGraphCounter counter;
+      counter(prim_func->body);
+      whole_graph_submit_count += counter.count;
+    }
+
+    bool verify_as_single_whole_graph =
+        mod->GetAttr<ffi::String>("typhoon_resnet18_plan").has_value() && typhoon_funcs.size() > 1 &&
+        whole_graph_submit_count == 1;
+
+    if (verify_as_single_whole_graph) {
+      TyphoonGraphVerifier verifier(whole_graph_sram_size);
+      for (const PrimFunc& func : typhoon_funcs) {
+        verifier.Consume(func);
+      }
+      verifier.Finish();
+      return mod;
+    }
+
+    for (const PrimFunc& func : typhoon_funcs) {
+      auto target = func->GetAttr<Target>(tvm::attr::kTarget);
+      TVM_FFI_ICHECK(target.defined());
+
+      int64_t sram_size =
+          target.value()->GetAttr<Integer>("sram_size", Integer(1048576)).value().IntValue();
+      TyphoonGraphVerifier(sram_size).Verify(func);
     }
     return mod;
   };

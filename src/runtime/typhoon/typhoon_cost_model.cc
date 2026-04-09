@@ -53,12 +53,15 @@ int64_t EstimateLatencyFromWorkload(int64_t workload_term, const TyphoonHWConfig
   return std::max<int64_t>(1, hw.common_fixed_noise_cycles + workload_term);
 }
 
+int64_t DMATotalBytes(const TyphoonTask& task) { return task.bytes * task.dma_batch_count; }
+
 }  // namespace
 
 int64_t EstimateLatency(const TyphoonTask& task, const TyphoonHWConfig& hw) {
   switch (task.kind) {
     case TaskKind::kDMA:
-      return EstimateLatencyFromWorkload(DivRoundUp(task.bytes, hw.dma_bytes_per_cycle), hw);
+      return EstimateLatencyFromWorkload(DivRoundUp(DMATotalBytes(task), hw.dma_bytes_per_cycle),
+                                         hw);
     case TaskKind::kMatmul: {
       int64_t ops = task.m * task.n * task.k;
       return EstimateLatencyFromWorkload(DivRoundUp(ops, hw.matmul_ops_per_cycle), hw);
@@ -76,7 +79,7 @@ int64_t EstimateLatency(const TyphoonTask& task, const TyphoonHWConfig& hw) {
 int64_t EstimateSramBytesRead(const TyphoonTask& task) {
   switch (task.kind) {
     case TaskKind::kDMA:
-      return task.direction == 1 ? task.bytes : 0;
+      return task.direction == 1 ? DMATotalBytes(task) : 0;
     case TaskKind::kMatmul:
       return (task.m * task.k + task.k * task.n) * DTypeBytes(task.dtype_code);
     case TaskKind::kVector:
@@ -90,7 +93,7 @@ int64_t EstimateSramBytesRead(const TyphoonTask& task) {
 int64_t EstimateSramBytesWritten(const TyphoonTask& task) {
   switch (task.kind) {
     case TaskKind::kDMA:
-      return task.direction == 0 ? task.bytes : 0;
+      return task.direction == 0 ? DMATotalBytes(task) : 0;
     case TaskKind::kMatmul:
       return task.m * task.n * DTypeBytes(task.dtype_code);
     case TaskKind::kVector:

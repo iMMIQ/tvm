@@ -180,14 +180,21 @@ def test_finalize_host_passes_auto_builds_typhoon_graph_for_canonical_resnet18()
     out = tvm.tirx.pipeline.finalize_host_passes()(mod)
     assert "typhoon_resnet18_plan" in out.attrs
     assert "typhoon_sram_plan" in out.attrs
+    module_text = out.script()
+    assert module_text.count("TVMTyphoonGraphBegin") == 1
+    assert module_text.count("TVMTyphoonSubmitGraph") == 1
+    assert module_text.count("TVMTyphoonWaitGraph") == 1
     for name in ["conv2d", "conv2d1", "conv2d4"]:
         text = out[name].script()
-        assert "TVMTyphoonDeclareRegion" in text
-        assert "TVMTyphoonAddReshapeTask" in text
-        assert "TVMTyphoonAddMatmulTask" in text
-        assert "TVMTyphoonGraphBegin" in text
-        assert "TVMTyphoonSubmitGraph" in text
-        assert "TVMTyphoonWaitGraph" in text
+        assert "TVMTyphoonCaptureCallPlanned" in text
+        assert "TVMTyphoonDeclareRegion" not in text
+    final_text = out["add9"].script()
+    assert "TVMTyphoonCaptureCallPlanned" in final_text
+    assert "TVMTyphoonReplayWholeGraphBegin" in final_text
+    assert "TVMTyphoonReplayCapturedLayer" in final_text
+    assert "TVMTyphoonGetCapturedHandle" not in final_text
+    assert "TVMTyphoonAddReshapeTask" not in final_text
+    assert "TVMTyphoonAddMatmulTask" not in final_text
 
 
 def test_finalize_host_passes_auto_builds_typhoon_graph_for_canonical_head_ops():
@@ -195,9 +202,16 @@ def test_finalize_host_passes_auto_builds_typhoon_graph_for_canonical_head_ops()
     out = tvm.tirx.pipeline.finalize_host_passes()(mod)
     assert "typhoon_resnet18_plan" in out.attrs
     assert "typhoon_sram_plan" in out.attrs
-    assert "TVMTyphoonAddVectorTask" in out["mean"].script()
-    assert "TVMTyphoonAddMatmulTask" in out["matmul"].script()
-    assert "TVMTyphoonGraphBegin" in out["matmul"].script()
+    assert "TVMTyphoonCaptureCallPlanned" in out["mean"].script()
+    assert "TVMTyphoonCaptureCallPlanned" in out["matmul"].script()
+    final_text = out["add9"].script()
+    assert "TVMTyphoonReplayWholeGraphBegin" in final_text
+    assert "TVMTyphoonReplayCapturedLayer" in final_text
+    assert "TVMTyphoonAddVectorTask" not in final_text
+    assert "TVMTyphoonAddMatmulTask" not in final_text
+    module_text = out.script()
+    assert module_text.count("TVMTyphoonGraphBegin") == 1
+    assert module_text.count("TVMTyphoonSubmitGraph") == 1
 
 
 def test_build_typhoon_graph_graphizes_canonical_conv_primfuncs():
@@ -205,9 +219,13 @@ def test_build_typhoon_graph_graphizes_canonical_conv_primfuncs():
     mod = tvm.tirx.transform.IdentifyTyphoonResNet18()(mod)
     mod = tvm.tirx.transform.PlanTyphoonSRAM()(mod)
     out = tvm.tirx.transform.BuildTyphoonGraph()(mod)
+    module_text = out.script()
+    assert module_text.count("T.typhoon.submit_graph") == 1
 
     for name in ["conv2d", "conv2d1", "conv2d4"]:
         text = out[name].script()
-        assert "T.typhoon.task_reshape" in text
-        assert "T.typhoon.task_matmul" in text
-        assert "T.typhoon.submit_graph" in text
+        assert "TVMTyphoonCaptureCallPlanned" in text
+        assert "T.typhoon.task_reshape" not in text
+    final_text = out["add9"].script()
+    assert "T.typhoon.task_reshape" in final_text
+    assert "T.typhoon.task_matmul" in final_text

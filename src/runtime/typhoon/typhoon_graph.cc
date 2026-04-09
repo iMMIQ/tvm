@@ -67,6 +67,12 @@ void TyphoonGraphBuilder::DeclareRegion(int32_t region_id, int64_t offset, int64
                  " cannot be mutated after submit");
   }
   if (region_index_.count(region_id)) {
+    const auto& existing = regions_.at(region_index_.at(region_id));
+    std::string new_tag = tag == nullptr ? "" : tag;
+    if (existing.offset == offset && existing.size == size && existing.alignment == alignment &&
+        existing.preinitialized == preinitialized && existing.tag == new_tag) {
+      return;
+    }
     TyphoonError("Typhoon runtime duplicate region_id " + std::to_string(region_id));
   }
 
@@ -89,6 +95,16 @@ void TyphoonGraphBuilder::AddDMATask(int32_t task_id, int32_t direction, void* g
                                      int64_t global_byte_offset, int32_t sram_region_id,
                                      int64_t sram_byte_offset, int64_t bytes, int32_t num_deps,
                                      const int32_t* dep_ids) {
+  AddBatchedDMATask(task_id, direction, global_handle, global_byte_offset, 0, sram_region_id,
+                    sram_byte_offset, 0, bytes, 1, num_deps, dep_ids);
+}
+
+void TyphoonGraphBuilder::AddBatchedDMATask(int32_t task_id, int32_t direction,
+                                            void* global_handle, int64_t global_byte_offset,
+                                            int64_t global_stride, int32_t sram_region_id,
+                                            int64_t sram_byte_offset, int64_t sram_stride,
+                                            int64_t bytes, int64_t batch_count,
+                                            int32_t num_deps, const int32_t* dep_ids) {
   TyphoonTask task;
   task.kind = TaskKind::kDMA;
   task.task_id = task_id;
@@ -97,6 +113,9 @@ void TyphoonGraphBuilder::AddDMATask(int32_t task_id, int32_t direction, void* g
   task.direction = direction;
   task.sram_byte_offset = sram_byte_offset;
   task.bytes = bytes;
+  task.dma_batch_count = batch_count;
+  task.dma_global_stride = global_stride;
+  task.dma_sram_stride = sram_stride;
   if (direction == 0) {
     task.writes = {sram_region_id};
   } else if (direction == 1) {
@@ -135,7 +154,7 @@ void TyphoonGraphBuilder::AddVectorTask(int32_t task_id, int32_t op_code, int32_
   task.task_id = task_id;
   task.deps = CopyDeps(num_deps, dep_ids);
   task.reads = {in0_region_id};
-  if (op_code == 0) {
+  if (in1_region_id >= 0) {
     task.reads.push_back(in1_region_id);
   }
   task.writes = {out_region_id};
@@ -378,10 +397,26 @@ void TyphoonGraphBuilder::ValidateTaskFootprints() const {
   for (const auto& task : tasks_) {
     if (task.kind == TaskKind::kDMA) {
       const auto& region = task.direction == 0 ? GetRegion(task.writes.at(0)) : GetRegion(task.reads.at(0));
-      if (task.sram_byte_offset < 0 || task.bytes <= 0 ||
-          task.sram_byte_offset + task.bytes > region.size) {
+      if (task.bytes <= 0 || task.dma_batch_count <= 0 || task.sram_byte_offset < 0 ||
+          task.dma_global_stride < 0 || task.dma_sram_stride < 0) {
         TyphoonError("Typhoon DMA task " + std::to_string(task.task_id) +
-                     " has out-of-bounds size mismatch");
+                     " has invalid DMA footprint bytes=" + std::to_string(task.bytes) +
+                     " batch_count=" + std::to_string(task.dma_batch_count) +
+                     " sram_byte_offset=" + std::to_string(task.sram_byte_offset) +
+                     " global_stride=" + std::to_string(task.dma_global_stride) +
+                     " sram_stride=" + std::to_string(task.dma_sram_stride) +
+                     " region_size=" + std::to_string(region.size));
+      }
+      int64_t last_batch_offset =
+          (task.dma_batch_count - 1) * task.dma_sram_stride;
+      if (task.sram_byte_offset + last_batch_offset + task.bytes > region.size) {
+        TyphoonError("Typhoon DMA task " + std::to_string(task.task_id) +
+                     " has out-of-bounds size mismatch bytes=" + std::to_string(task.bytes) +
+                     " batch_count=" + std::to_string(task.dma_batch_count) +
+                     " sram_byte_offset=" + std::to_string(task.sram_byte_offset) +
+                     " sram_stride=" + std::to_string(task.dma_sram_stride) +
+                     " last_batch_offset=" + std::to_string(last_batch_offset) +
+                     " region_size=" + std::to_string(region.size));
       }
       continue;
     }
@@ -477,6 +512,28 @@ void TyphoonGraphBuilder::ValidateTaskFootprints() const {
           }
           input_bytes = n * c * in_h * in_w * 4;
           output_bytes = task.elem_count * 4;
+          break;
+        }
+        case 4: {
+          if (task.dtype_code != 2) {
+            TyphoonError(task_prefix + " channel_bias_add currently requires dtype_code=2");
+          }
+          if (task.metadata.size() != 2) {
+            TyphoonError(task_prefix + " channel_bias_add metadata must have 2 values");
+          }
+          int64_t channels = RequireMetadataValue(task.metadata, 0, task_prefix);
+          int64_t plane_elems = RequireMetadataValue(task.metadata, 1, task_prefix);
+          if (channels <= 0 || plane_elems <= 0) {
+            TyphoonError(task_prefix + " channel_bias_add metadata values must be positive");
+          }
+          if (task.elem_count != channels * plane_elems) {
+            TyphoonError(task_prefix + " channel_bias_add elem_count does not match metadata");
+          }
+          input_bytes = task.elem_count * 4;
+          output_bytes = task.elem_count * 4;
+          if (channels * 4 > GetRegion(task.reads.at(1)).size) {
+            TyphoonError(task_prefix + " has out-of-bounds size mismatch");
+          }
           break;
         }
         default:

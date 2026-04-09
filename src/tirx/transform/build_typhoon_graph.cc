@@ -26,6 +26,7 @@
 #include <tvm/ffi/string.h>
 #include <tvm/target/target.h>
 #include <tvm/tirx/buffer.h>
+#include <tvm/tirx/builtin.h>
 #include <tvm/tirx/expr.h>
 #include <tvm/tirx/function.h>
 #include <tvm/tirx/op.h>
@@ -35,6 +36,8 @@
 #include <optional>
 #include <regex>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -68,6 +71,17 @@ struct Conv2DConfig {
   int64_t pad_h{0};
   int64_t pad_w{0};
   int64_t patch_size{0};
+};
+
+struct PlannedLayer {
+  int64_t layer_id{0};
+  std::string kind;
+  std::string symbol;
+  std::vector<int64_t> logical_input_shape;
+  std::vector<int64_t> logical_output_shape;
+  std::vector<int64_t> weight_shape;
+  std::vector<int64_t> secondary_input_shape;
+  bool requires_im2col{false};
 };
 
 const std::vector<RegionSpec>& GetCanonicalRegions() {
@@ -114,6 +128,119 @@ std::vector<int64_t> ExtractArray(const std::string& json, const char* key) {
   TVM_FFI_CHECK(std::regex_search(json, match, pattern), ValueError)
       << "BuildTyphoonGraph could not find `" << key << "`";
   return ParseIntList(match[1].str());
+}
+
+bool TryExtractArray(const std::string& json, const char* key, std::vector<int64_t>* value) {
+  std::regex pattern(std::string("\"") + key + "\"\\s*:\\s*\\[([^\\]]*)\\]");
+  std::smatch match;
+  if (!std::regex_search(json, match, pattern)) {
+    return false;
+  }
+  *value = ParseIntList(match[1].str());
+  return true;
+}
+
+std::string ExtractString(const std::string& json, const char* key) {
+  std::regex pattern(std::string("\"") + key + "\"\\s*:\\s*\"([^\"]+)\"");
+  std::smatch match;
+  TVM_FFI_CHECK(std::regex_search(json, match, pattern), ValueError)
+      << "BuildTyphoonGraph could not find `" << key << "`";
+  return match[1].str();
+}
+
+bool TryExtractBool(const std::string& json, const char* key, bool* value) {
+  std::regex pattern(std::string("\"") + key + "\"\\s*:\\s*(true|false)");
+  std::smatch match;
+  if (!std::regex_search(json, match, pattern)) {
+    return false;
+  }
+  *value = match[1].str() == "true";
+  return true;
+}
+
+int64_t ExtractInt(const std::string& json, const char* key) {
+  std::regex pattern(std::string("\"") + key + "\"\\s*:\\s*(-?[0-9]+)");
+  std::smatch match;
+  TVM_FFI_CHECK(std::regex_search(json, match, pattern), ValueError)
+      << "BuildTyphoonGraph could not find `" << key << "`";
+  return std::stoll(match[1].str());
+}
+
+std::string ExtractJSONArrayText(const std::string& json, const char* key) {
+  std::string needle = std::string("\"") + key + "\"";
+  size_t key_pos = json.find(needle);
+  TVM_FFI_CHECK_NE(key_pos, std::string::npos, ValueError)
+      << "BuildTyphoonGraph could not find `" << key << "`";
+  size_t array_start = json.find('[', key_pos);
+  TVM_FFI_CHECK_NE(array_start, std::string::npos, ValueError)
+      << "BuildTyphoonGraph could not find array `" << key << "`";
+
+  int depth = 0;
+  bool in_string = false;
+  for (size_t i = array_start; i < json.size(); ++i) {
+    char c = json[i];
+    if (c == '"' && (i == 0 || json[i - 1] != '\\')) {
+      in_string = !in_string;
+    }
+    if (in_string) {
+      continue;
+    }
+    if (c == '[') {
+      ++depth;
+    } else if (c == ']') {
+      --depth;
+      if (depth == 0) {
+        return json.substr(array_start, i - array_start + 1);
+      }
+    }
+  }
+  TVM_FFI_THROW(ValueError) << "BuildTyphoonGraph found unterminated array `" << key << "`";
+}
+
+std::vector<std::string> SplitTopLevelObjects(const std::string& array_json) {
+  std::vector<std::string> objects;
+  int depth = 0;
+  bool in_string = false;
+  size_t object_start = std::string::npos;
+  for (size_t i = 0; i < array_json.size(); ++i) {
+    char c = array_json[i];
+    if (c == '"' && (i == 0 || array_json[i - 1] != '\\')) {
+      in_string = !in_string;
+    }
+    if (in_string) {
+      continue;
+    }
+    if (c == '{') {
+      if (depth == 0) {
+        object_start = i;
+      }
+      ++depth;
+    } else if (c == '}') {
+      --depth;
+      if (depth == 0 && object_start != std::string::npos) {
+        objects.push_back(array_json.substr(object_start, i - object_start + 1));
+      }
+    }
+  }
+  return objects;
+}
+
+std::vector<PlannedLayer> ParsePlannedLayers(const std::string& plan_json) {
+  std::vector<PlannedLayer> layers;
+  for (const std::string& object : SplitTopLevelObjects(ExtractJSONArrayText(plan_json, "layers"))) {
+    PlannedLayer layer;
+    layer.layer_id = ExtractInt(object, "layer_id");
+    layer.kind = ExtractString(object, "kind");
+    layer.symbol = ExtractString(object, "symbol");
+    layer.logical_input_shape = ExtractArray(object, "logical_input_shape");
+    layer.logical_output_shape = ExtractArray(object, "logical_output_shape");
+    TryExtractArray(object, "weight_shape", &layer.weight_shape);
+    TryExtractArray(object, "secondary_input_shape", &layer.secondary_input_shape);
+    TryExtractBool(object, "requires_im2col", &layer.requires_im2col);
+    layers.push_back(std::move(layer));
+  }
+  TVM_FFI_CHECK(!layers.empty(), ValueError) << "BuildTyphoonGraph requires planned layers";
+  return layers;
 }
 
 std::vector<RegionSpec> ExtractRegions(const std::string& json) {
@@ -266,6 +393,428 @@ std::string GlobalSymbol(const PrimFunc& func) {
 bool IsTyphoonTargeted(const PrimFunc& func) {
   auto target = func->GetAttr<Target>(tvm::attr::kTarget);
   return target.defined() && target.value()->kind->name == "typhoon";
+}
+
+struct StandaloneGraphSegment {
+  ffi::Array<Stmt> region_stmts;
+  ffi::Array<Stmt> task_stmts;
+  int64_t task_count{0};
+  std::vector<int64_t> root_task_ids;
+  std::vector<int64_t> sink_task_ids;
+};
+
+struct LayerSegmentTemplate {
+  PrimFunc func;
+  StandaloneGraphSegment segment;
+  std::unordered_map<const VarNode*, int> buffer_data_slot;
+};
+
+bool IsEvaluateCallOp(const Stmt& stmt, const Op& op, const CallNode** out_call = nullptr) {
+  const auto* eval = stmt.as<EvaluateNode>();
+  if (eval == nullptr) {
+    return false;
+  }
+  const auto* call = eval->value.as<CallNode>();
+  if (call == nullptr || !call->op.same_as(op)) {
+    return false;
+  }
+  if (out_call != nullptr) {
+    *out_call = call;
+  }
+  return true;
+}
+
+int64_t ExpectIntImm(const PrimExpr& expr, const char* field) {
+  const auto* imm = expr.as<IntImmNode>();
+  TVM_FFI_CHECK(imm != nullptr, ValueError)
+      << "BuildTyphoonGraph requires constant integer " << field;
+  return imm->value;
+}
+
+int64_t GetTaskDepIndex(const CallNode* call) {
+  static const Op& task_dma_op = Op::Get("tirx.typhoon.task_dma");
+  static const Op& task_matmul_op = Op::Get("tirx.typhoon.task_matmul");
+  static const Op& task_vector_op = Op::Get("tirx.typhoon.task_vector");
+  static const Op& task_reshape_op = Op::Get("tirx.typhoon.task_reshape");
+  if (call->op.same_as(task_dma_op)) {
+    return 8;
+  }
+  if (call->op.same_as(task_matmul_op)) {
+    return 10;
+  }
+  if (call->op.same_as(task_vector_op)) {
+    return 9 + ExpectIntImm(call->args[8], "num_metadata");
+  }
+  if (call->op.same_as(task_reshape_op)) {
+    return 7 + ExpectIntImm(call->args[6], "num_metadata");
+  }
+  TVM_FFI_THROW(ValueError) << "BuildTyphoonGraph could not identify Typhoon task dependency slot";
+  return -1;
+}
+
+std::vector<int64_t> ParseTaskDeps(const CallNode* call) {
+  int64_t dep_index = GetTaskDepIndex(call);
+  int64_t num_deps = ExpectIntImm(call->args[dep_index], "num_deps");
+  std::vector<int64_t> deps;
+  deps.reserve(num_deps);
+  for (int64_t i = 0; i < num_deps; ++i) {
+    deps.push_back(ExpectIntImm(call->args[dep_index + 1 + i], "dep_task_id"));
+  }
+  return deps;
+}
+
+StandaloneGraphSegment ExtractStandaloneGraphSegment(const PrimFunc& func) {
+  static const Op& region_decl_op = Op::Get("tirx.typhoon.region_decl");
+  static const Op& task_dma_op = Op::Get("tirx.typhoon.task_dma");
+  static const Op& task_matmul_op = Op::Get("tirx.typhoon.task_matmul");
+  static const Op& task_vector_op = Op::Get("tirx.typhoon.task_vector");
+  static const Op& task_reshape_op = Op::Get("tirx.typhoon.task_reshape");
+  static const Op& submit_graph_op = Op::Get("tirx.typhoon.submit_graph");
+  static const Op& wait_graph_op = Op::Get("tirx.typhoon.wait_graph");
+
+  ffi::Array<Stmt> seq;
+  if (const auto* seq_stmt = func->body.as<SeqStmtNode>()) {
+    seq = seq_stmt->seq;
+  } else {
+    seq.push_back(func->body);
+  }
+
+  StandaloneGraphSegment segment;
+  std::vector<int64_t> task_ids;
+  std::unordered_set<int64_t> consumed_task_ids;
+  for (const Stmt& stmt : seq) {
+    const CallNode* call = nullptr;
+    if (IsEvaluateCallOp(stmt, region_decl_op, &call)) {
+      segment.region_stmts.push_back(stmt);
+      continue;
+    }
+    if (IsEvaluateCallOp(stmt, submit_graph_op, &call) || IsEvaluateCallOp(stmt, wait_graph_op, &call)) {
+      continue;
+    }
+    if (IsEvaluateCallOp(stmt, task_dma_op, &call) || IsEvaluateCallOp(stmt, task_matmul_op, &call) ||
+        IsEvaluateCallOp(stmt, task_vector_op, &call) || IsEvaluateCallOp(stmt, task_reshape_op, &call)) {
+      int64_t task_id = ExpectIntImm(call->args[1], "task_id");
+      std::vector<int64_t> deps = ParseTaskDeps(call);
+      task_ids.push_back(task_id);
+      if (deps.empty()) {
+        segment.root_task_ids.push_back(task_id);
+      }
+      for (int64_t dep : deps) {
+        consumed_task_ids.insert(dep);
+      }
+      segment.task_stmts.push_back(stmt);
+      continue;
+    }
+    TVM_FFI_THROW(ValueError)
+        << "BuildTyphoonGraph standalone canonical body contains unsupported statement";
+  }
+
+  TVM_FFI_CHECK(!task_ids.empty(), ValueError)
+      << "BuildTyphoonGraph expected canonical Typhoon segment to contain tasks";
+  segment.task_count = *std::max_element(task_ids.begin(), task_ids.end()) + 1;
+  for (int64_t task_id : task_ids) {
+    if (!consumed_task_ids.count(task_id)) {
+      segment.sink_task_ids.push_back(task_id);
+    }
+  }
+  TVM_FFI_CHECK(!segment.sink_task_ids.empty(), ValueError)
+      << "BuildTyphoonGraph expected canonical Typhoon segment to have terminal tasks";
+  return segment;
+}
+
+Stmt RewriteStandaloneTaskStmt(const Stmt& stmt, int64_t task_id_offset,
+                               const std::vector<int64_t>& prev_segment_deps) {
+  const auto* eval = stmt.as<EvaluateNode>();
+  TVM_FFI_CHECK(eval != nullptr, ValueError)
+      << "BuildTyphoonGraph expected Evaluate Typhoon task statement";
+  const auto* call = eval->value.as<CallNode>();
+  TVM_FFI_CHECK(call != nullptr, ValueError)
+      << "BuildTyphoonGraph expected Typhoon task call";
+
+  int64_t dep_index = GetTaskDepIndex(call);
+  int64_t original_num_deps = ExpectIntImm(call->args[dep_index], "num_deps");
+  std::vector<int64_t> rewritten_deps;
+  rewritten_deps.reserve(original_num_deps + prev_segment_deps.size());
+  if (original_num_deps == 0) {
+    rewritten_deps.insert(rewritten_deps.end(), prev_segment_deps.begin(), prev_segment_deps.end());
+  }
+  for (int64_t i = 0; i < original_num_deps; ++i) {
+    rewritten_deps.push_back(
+        ExpectIntImm(call->args[dep_index + 1 + i], "dep_task_id") + task_id_offset);
+  }
+
+  ffi::Array<PrimExpr> args;
+  for (int64_t i = 0; i < dep_index; ++i) {
+    if (i == 1) {
+      args.push_back(Int32Const(ExpectIntImm(call->args[i], "task_id") + task_id_offset));
+    } else {
+      args.push_back(call->args[i]);
+    }
+  }
+  args.push_back(Int32Const(rewritten_deps.size()));
+  for (int64_t dep : rewritten_deps) {
+    args.push_back(Int32Const(dep));
+  }
+  return Evaluate(Call(DataType::Int(32), Downcast<Op>(call->op), args));
+}
+
+PrimFunc RewriteStandaloneSegmentBody(PrimFunc func, const StandaloneGraphSegment& segment,
+                                      int64_t task_id_offset,
+                                      const std::vector<int64_t>& prev_segment_deps,
+                                      bool emit_regions, bool emit_submit_wait) {
+  ffi::Array<Stmt> stmts;
+  if (emit_regions) {
+    for (const Stmt& stmt : segment.region_stmts) {
+      stmts.push_back(stmt);
+    }
+  }
+  for (const Stmt& stmt : segment.task_stmts) {
+    stmts.push_back(RewriteStandaloneTaskStmt(stmt, task_id_offset, prev_segment_deps));
+  }
+  if (emit_submit_wait) {
+    stmts.push_back(SubmitGraphStmt(0));
+    stmts.push_back(WaitGraphStmt(0));
+  }
+  auto* n = func.CopyOnWrite();
+  n->body = SeqStmt(stmts);
+  return func;
+}
+
+std::vector<int64_t> OffsetTaskIds(const std::vector<int64_t>& task_ids, int64_t offset);
+
+PrimExpr CapturedHandleExpr(int64_t graph_id, int64_t layer_id, int64_t slot) {
+  ffi::Array<PrimExpr> args{StringImm("TVMTyphoonGetCapturedHandle"), Int32Const(graph_id),
+                            Int32Const(layer_id), Int32Const(slot)};
+  return Call(DataType::Handle(), builtin::call_extern(), args);
+}
+
+std::string SerializeLayerIdCSV(const std::vector<int64_t>& layer_ids);
+Stmt CaptureCallStmt(int64_t graph_id, const std::vector<int64_t>& layer_ids, const PrimFunc& func);
+Stmt CapturePackedArgsStmt(int64_t graph_id, const std::vector<int64_t>& layer_ids,
+                           const PrimFunc& func);
+
+Stmt CaptureCallStmt(int64_t graph_id, int64_t layer_id, const PrimFunc& func) {
+  return CaptureCallStmt(graph_id, std::vector<int64_t>{layer_id}, func);
+}
+
+std::string SerializeLayerIdCSV(const std::vector<int64_t>& layer_ids) {
+  std::ostringstream os;
+  for (size_t i = 0; i < layer_ids.size(); ++i) {
+    if (i != 0) {
+      os << ",";
+    }
+    os << layer_ids[i];
+  }
+  return os.str();
+}
+
+Stmt CaptureCallStmt(int64_t graph_id, const std::vector<int64_t>& layer_ids, const PrimFunc& func) {
+  TVM_FFI_CHECK(!layer_ids.empty(), ValueError)
+      << "BuildTyphoonGraph planned capture requires at least one layer_id";
+  ffi::Array<PrimExpr> args{StringImm("TVMTyphoonCaptureCallPlanned"), Int32Const(graph_id),
+                            StringImm(SerializeLayerIdCSV(layer_ids)),
+                            Int32Const(func->params.size())};
+  for (size_t i = 0; i < 3; ++i) {
+    if (i < func->params.size()) {
+      args.push_back(func->params[i]);
+    } else {
+      args.push_back(make_zero(DataType::Handle()));
+    }
+  }
+  return Evaluate(Call(DataType::Int(32), builtin::call_extern(), args));
+}
+
+Stmt CapturePackedArgsStmt(int64_t graph_id, int64_t layer_id, const PrimFunc& func) {
+  return CapturePackedArgsStmt(graph_id, std::vector<int64_t>{layer_id}, func);
+}
+
+Stmt CapturePackedArgsStmt(int64_t graph_id, const std::vector<int64_t>& layer_ids,
+                           const PrimFunc& func) {
+  TVM_FFI_CHECK(!layer_ids.empty(), ValueError)
+      << "BuildTyphoonGraph planned packed capture requires at least one layer_id";
+  TVM_FFI_CHECK_GE(func->params.size(), 3, ValueError)
+      << "BuildTyphoonGraph expected packed FFI function to have args and num_args params";
+  ffi::Array<PrimExpr> args{StringImm("TVMTyphoonCapturePackedArgsPlanned"), Int32Const(graph_id),
+                            StringImm(SerializeLayerIdCSV(layer_ids)), func->params[1],
+                            func->params[2]};
+  return Evaluate(Call(DataType::Int(32), builtin::call_extern(), args));
+}
+
+LayerSegmentTemplate MakeLayerSegmentTemplate(PrimFunc func) {
+  LayerSegmentTemplate templ;
+  templ.func = func;
+  templ.segment = ExtractStandaloneGraphSegment(func);
+  for (size_t i = 0; i < func->params.size(); ++i) {
+    auto it = func->buffer_map.find(func->params[i]);
+    TVM_FFI_CHECK(it != func->buffer_map.end(), ValueError)
+        << "BuildTyphoonGraph expected template params to be buffer-bound";
+    const Buffer& buffer = (*it).second;
+    templ.buffer_data_slot[buffer->data.get()] = static_cast<int>(i);
+  }
+  return templ;
+}
+
+Stmt RewritePlannedTaskStmt(const Stmt& stmt, int64_t graph_id, int64_t layer_id,
+                           const LayerSegmentTemplate& templ, int64_t task_id_offset,
+                           const std::vector<int64_t>& prev_segment_deps) {
+  const auto* eval = stmt.as<EvaluateNode>();
+  TVM_FFI_CHECK(eval != nullptr, ValueError)
+      << "BuildTyphoonGraph expected Evaluate Typhoon task statement";
+  const auto* call = eval->value.as<CallNode>();
+  TVM_FFI_CHECK(call != nullptr, ValueError) << "BuildTyphoonGraph expected Typhoon task call";
+
+  int64_t dep_index = GetTaskDepIndex(call);
+  int64_t original_num_deps = ExpectIntImm(call->args[dep_index], "num_deps");
+  std::vector<int64_t> rewritten_deps;
+  rewritten_deps.reserve(original_num_deps + prev_segment_deps.size());
+  if (original_num_deps == 0) {
+    rewritten_deps.insert(rewritten_deps.end(), prev_segment_deps.begin(), prev_segment_deps.end());
+  }
+  for (int64_t i = 0; i < original_num_deps; ++i) {
+    rewritten_deps.push_back(
+        ExpectIntImm(call->args[dep_index + 1 + i], "dep_task_id") + task_id_offset);
+  }
+
+  ffi::Array<PrimExpr> args;
+  for (int64_t i = 0; i < dep_index; ++i) {
+    if (i == 0) {
+      args.push_back(Int32Const(graph_id));
+      continue;
+    }
+    if (i == 1) {
+      args.push_back(Int32Const(ExpectIntImm(call->args[i], "task_id") + task_id_offset));
+      continue;
+    }
+    if (call->op.same_as(Op::Get("tirx.typhoon.task_dma")) && i == 3) {
+      if (const auto* var = call->args[i].as<VarNode>()) {
+        auto it = templ.buffer_data_slot.find(var);
+        if (it != templ.buffer_data_slot.end()) {
+          args.push_back(CapturedHandleExpr(graph_id, layer_id, it->second));
+          continue;
+        }
+      }
+    }
+    args.push_back(call->args[i]);
+  }
+  args.push_back(Int32Const(rewritten_deps.size()));
+  for (int64_t dep : rewritten_deps) {
+    args.push_back(Int32Const(dep));
+  }
+  return Evaluate(Call(DataType::Int(32), Downcast<Op>(call->op), args));
+}
+
+ffi::Array<Stmt> BuildPlannedWholeGraphStmts(
+    int64_t graph_id, const std::vector<PlannedLayer>& layers,
+    const std::unordered_map<std::string, LayerSegmentTemplate>& templates) {
+  ffi::Array<Stmt> stmts;
+  for (const RegionSpec& region : GetCanonicalRegions()) {
+    stmts.push_back(RegionDeclStmt(graph_id, region));
+  }
+
+  int64_t task_id_offset = 0;
+  std::vector<int64_t> prev_segment_deps;
+  for (const PlannedLayer& layer : layers) {
+    auto it = templates.find(layer.symbol);
+    TVM_FFI_CHECK(it != templates.end(), ValueError)
+        << "BuildTyphoonGraph missing canonical segment template for `" << layer.symbol << "`";
+    const LayerSegmentTemplate& templ = it->second;
+    for (const Stmt& task_stmt : templ.segment.task_stmts) {
+      stmts.push_back(
+          RewritePlannedTaskStmt(task_stmt, graph_id, layer.layer_id, templ, task_id_offset,
+                                 prev_segment_deps));
+    }
+    prev_segment_deps = OffsetTaskIds(templ.segment.sink_task_ids, task_id_offset);
+    task_id_offset += templ.segment.task_count;
+  }
+  stmts.push_back(SubmitGraphStmt(graph_id));
+  stmts.push_back(WaitGraphStmt(graph_id));
+  return stmts;
+}
+
+int32_t CanonicalReplayKindCode(const PlannedLayer& layer) {
+  if (layer.kind == "conv2d") {
+    return 1;
+  }
+  if (layer.kind == "relu") {
+    return 2;
+  }
+  if (layer.kind == "bias_add" || layer.kind == "add" || layer.kind == "residual_add") {
+    return 3;
+  }
+  if (layer.kind == "max_pool2d") {
+    return 4;
+  }
+  if (layer.kind == "global_avg_pool") {
+    return 5;
+  }
+  if (layer.kind == "matmul") {
+    return 6;
+  }
+  if (layer.kind == "transpose" || layer.kind == "reshape") {
+    return 7;
+  }
+  TVM_FFI_THROW(ValueError) << "BuildTyphoonGraph does not support replay kind `" << layer.kind
+                            << "`";
+  return 0;
+}
+
+bool IsPackedFFISymbol(const std::string& symbol) {
+  static constexpr const char* kPackedFFIPrefix = "__tvm_ffi_";
+  return symbol.rfind(kPackedFFIPrefix, 0) == 0;
+}
+
+Stmt ReplayWholeGraphBeginStmt(int64_t graph_id) {
+  ffi::Array<PrimExpr> args{StringImm("TVMTyphoonReplayWholeGraphBegin"), Int32Const(graph_id)};
+  return Evaluate(Call(DataType::Int(32), builtin::call_extern(), args));
+}
+
+Stmt ReplayCapturedLayerStmt(int64_t graph_id, int64_t layer_id, int32_t replay_kind_code) {
+  ffi::Array<PrimExpr> args{StringImm("TVMTyphoonReplayCapturedLayer"), Int32Const(graph_id),
+                            Int32Const(layer_id), Int32Const(replay_kind_code)};
+  return Evaluate(Call(DataType::Int(32), builtin::call_extern(), args));
+}
+
+ffi::Array<Stmt> BuildReplayWholeGraphStmts(int64_t graph_id, const PrimFunc& final_func,
+                                            const std::vector<PlannedLayer>& layers) {
+  ffi::Array<Stmt> stmts;
+  std::vector<int64_t> final_layer_ids{layers.back().layer_id};
+  bool is_packed_ffi = IsPackedFFISymbol(GlobalSymbol(final_func));
+  if (is_packed_ffi) {
+    stmts.push_back(CapturePackedArgsStmt(graph_id, final_layer_ids, final_func));
+  } else {
+    stmts.push_back(CaptureCallStmt(graph_id, final_layer_ids, final_func));
+  }
+  stmts.push_back(ReplayWholeGraphBeginStmt(graph_id));
+  for (const PlannedLayer& layer : layers) {
+    stmts.push_back(
+        ReplayCapturedLayerStmt(graph_id, layer.layer_id, CanonicalReplayKindCode(layer)));
+  }
+  stmts.push_back(SubmitGraphStmt(graph_id));
+  stmts.push_back(WaitGraphStmt(graph_id));
+  if (is_packed_ffi) {
+    stmts.push_back(Evaluate(ret(Integer(0))));
+  }
+  return stmts;
+}
+
+bool MatchesPlannedSymbol(const std::string& actual_symbol, const std::string& planned_symbol) {
+  if (actual_symbol == planned_symbol) {
+    return true;
+  }
+  static constexpr const char* kPackedFFIPrefix = "__tvm_ffi_";
+  if (actual_symbol.rfind(kPackedFFIPrefix, 0) == 0) {
+    return actual_symbol.substr(std::strlen(kPackedFFIPrefix)) == planned_symbol;
+  }
+  return false;
+}
+
+std::vector<int64_t> OffsetTaskIds(const std::vector<int64_t>& task_ids, int64_t offset) {
+  std::vector<int64_t> rewritten;
+  rewritten.reserve(task_ids.size());
+  for (int64_t task_id : task_ids) {
+    rewritten.push_back(task_id + offset);
+  }
+  return rewritten;
 }
 
 void AppendGraphPrelude(ffi::Array<Stmt>* stmts, int64_t graph_id,
@@ -890,6 +1439,20 @@ Pass BuildTyphoonGraph() {
     auto* write_ptr = updated.CopyOnWrite();
     int64_t graph_id = 0;
     bool single_function = mod->functions.size() == 1;
+    std::vector<PlannedLayer> planned_layers;
+    if (!single_function) {
+      planned_layers = ParsePlannedLayers(resnet_plan.value());
+    }
+    std::unordered_set<std::string> planned_symbols;
+    std::unordered_map<std::string, std::vector<int64_t>> planned_layer_ids_by_symbol;
+    for (const PlannedLayer& layer : planned_layers) {
+      planned_symbols.insert(layer.symbol);
+      planned_layer_ids_by_symbol[layer.symbol].push_back(layer.layer_id);
+    }
+    std::string final_symbol = planned_layers.empty() ? "" : planned_layers.back().symbol;
+
+    std::unordered_map<std::string, std::pair<GlobalVar, PrimFunc>> typhoon_funcs_by_symbol;
+    std::unordered_map<std::string, LayerSegmentTemplate> layer_templates;
     for (const auto& [gvar, base_func] : mod->functions) {
       const auto* func = base_func.as<PrimFuncNode>();
       if (func == nullptr) {
@@ -905,18 +1468,90 @@ Pass BuildTyphoonGraph() {
                                                sram_plan.value()));
         continue;
       }
-      if (auto rewritten = MaybeBuildCanonicalFunction(prim_func)) {
-        write_ptr->Update(gvar, std::move(rewritten.value()));
+      std::string symbol = GlobalSymbol(prim_func);
+      if (symbol.empty()) {
+        continue;
       }
+      typhoon_funcs_by_symbol[symbol] = {gvar, prim_func};
+      if (planned_symbols.count(symbol) != 0) {
+        auto rewritten = MaybeBuildCanonicalFunction(prim_func);
+        TVM_FFI_CHECK(rewritten.has_value(), ValueError)
+            << "BuildTyphoonGraph could not build canonical segment for `" << symbol << "`";
+        layer_templates.emplace(symbol, MakeLayerSegmentTemplate(rewritten.value()));
+      }
+    }
+
+    if (!single_function && !planned_layers.empty()) {
+      for (const PlannedLayer& layer : planned_layers) {
+        TVM_FFI_CHECK(typhoon_funcs_by_symbol.count(layer.symbol) != 0, ValueError)
+            << "BuildTyphoonGraph plan references missing symbol `" << layer.symbol << "`";
+        TVM_FFI_CHECK(layer_templates.count(layer.symbol) != 0, ValueError)
+            << "BuildTyphoonGraph plan references untemplated symbol `" << layer.symbol << "`";
+      }
+
+      for (const auto& [symbol, entry] : typhoon_funcs_by_symbol) {
+        if (planned_symbols.count(symbol) == 0) {
+          continue;
+        }
+        PrimFunc rewritten = entry.second;
+        auto* n = rewritten.CopyOnWrite();
+        ffi::Array<Stmt> stmts{
+            CaptureCallStmt(graph_id, planned_layer_ids_by_symbol.at(symbol), entry.second)};
+        if (symbol == final_symbol) {
+          for (const Stmt& stmt : BuildPlannedWholeGraphStmts(graph_id, planned_layers, layer_templates)) {
+            stmts.push_back(stmt);
+          }
+        }
+        n->body = stmts.size() == 1 ? stmts[0] : SeqStmt(stmts);
+        write_ptr->Update(entry.first, rewritten);
+      }
+      return updated;
     }
     return updated;
   };
   return CreateModulePass(pass_func, 0, "tirx.BuildTyphoonGraph", {});
 }
 
+Pass CompactTyphoonWholeGraph() {
+  auto pass_func = [](IRModule mod, PassContext ctx) {
+    auto resnet_plan = mod->GetAttr<ffi::String>("typhoon_resnet18_plan");
+    if (!resnet_plan.has_value()) {
+      return mod;
+    }
+
+    std::vector<PlannedLayer> planned_layers = ParsePlannedLayers(resnet_plan.value());
+    TVM_FFI_CHECK(!planned_layers.empty(), ValueError)
+        << "CompactTyphoonWholeGraph requires planned layers";
+    std::string final_symbol = planned_layers.back().symbol;
+
+    IRModule updated = mod;
+    for (const auto& [gvar, base_func] : mod->functions) {
+      const auto* func = base_func.as<PrimFuncNode>();
+      if (func == nullptr) {
+        continue;
+      }
+      PrimFunc prim_func = ffi::GetRef<PrimFunc>(func);
+      auto target = prim_func->GetAttr<Target>(tvm::attr::kTarget);
+      if (!target.defined() || target.value()->kind->name != "typhoon") {
+        continue;
+      }
+      if (!MatchesPlannedSymbol(GlobalSymbol(prim_func), final_symbol)) {
+        continue;
+      }
+      auto* n = prim_func.CopyOnWrite();
+      n->body = SeqStmt(BuildReplayWholeGraphStmts(0, prim_func, planned_layers));
+      updated->Add(gvar, prim_func, true);
+      break;
+    }
+    return updated;
+  };
+  return CreateModulePass(pass_func, 0, "tirx.CompactTyphoonWholeGraph", {});
+}
+
 TVM_FFI_STATIC_INIT_BLOCK() {
   namespace refl = tvm::ffi::reflection;
   refl::GlobalDef().def("tirx.transform.BuildTyphoonGraph", BuildTyphoonGraph);
+  refl::GlobalDef().def("tirx.transform.CompactTyphoonWholeGraph", CompactTyphoonWholeGraph);
 }
 
 }  // namespace transform

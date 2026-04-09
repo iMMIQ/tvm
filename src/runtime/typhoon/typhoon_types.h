@@ -66,6 +66,9 @@ struct TyphoonTask {
   int32_t layout_code{0};
   int64_t sram_byte_offset{0};
   int64_t bytes{0};
+  int64_t dma_batch_count{1};
+  int64_t dma_global_stride{0};
+  int64_t dma_sram_stride{0};
   int64_t elem_count{0};
   int32_t dtype_code{0};
   int64_t m{0};

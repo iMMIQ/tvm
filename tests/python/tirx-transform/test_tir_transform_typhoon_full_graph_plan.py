@@ -46,13 +46,13 @@ def test_typhoon_resnet18_recognizes_full_graph_scope():
     assert plan["model"] == "resnet18"
     assert plan["input_shape"] == [1, 3, 224, 224]
     assert plan["dtype"] == "float32"
-    assert len(plan["layers"]) >= 29
+    assert len(plan["layers"]) >= 70
     assert [stage["stage_id"] for stage in plan["stages"]] == [0, 1, 2, 3]
     assert [block["block_id"] for block in plan["blocks"][:2]] == [0, 1]
     layer_ids = [layer["layer_id"] for layer in plan["layers"]]
     assert len(layer_ids) == len(set(layer_ids))
     first = plan["layers"][0]
-    assert {"layer_id", "kind", "logical_input_shape", "logical_output_shape"} <= first.keys()
+    assert {"layer_id", "kind", "symbol", "logical_input_shape", "logical_output_shape"} <= first.keys()
     assert all(
         {"layer_id", "stage_id", "block_id", "kind", "logical_input_shape", "logical_output_shape"}
         <= set(layer.keys())
@@ -62,8 +62,9 @@ def test_typhoon_resnet18_recognizes_full_graph_scope():
     assert any(layer.get("requires_im2col", False) for layer in plan["layers"])
     assert any(edge.get("edge_kind") == "residual" for edge in plan["edges"])
     assert all(edge["src_layer_id"] in layer_ids and edge["dst_layer_id"] in layer_ids for edge in plan["edges"])
-    assert [layer["kind"] for layer in plan["layers"][-3:]] == [
+    assert [layer["kind"] for layer in plan["layers"][-4:]] == [
         "global_avg_pool",
-        "flatten",
-        "dense",
+        "transpose",
+        "matmul",
+        "bias_add",
     ]

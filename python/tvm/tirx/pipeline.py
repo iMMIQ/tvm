@@ -106,6 +106,7 @@ def finalize_host_passes():  # pylint: disable=unused-argument
         tirx.transform.LowerCustomDatatypes(),
         _maybe_build_typhoon_graph,
         tirx.transform.VerifyTyphoonGraph(),
+        tirx.transform.CompactTyphoonWholeGraph(),
         tirx.transform.LowerTyphoonTaskDeps(),
         tirx.transform.LowerTyphoonSubmitGraph(),
         tirx.transform.LowerIntrin(),

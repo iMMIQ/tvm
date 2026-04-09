@@ -64,10 +64,15 @@ def _extract_ffi_function_bodies(source):
     }
 
 
-def _assert_graphized_function_has_no_host_fallback(body, *required_markers):
-    assert "TVMTyphoonGraphBegin" in body
-    assert "TVMTyphoonSubmitGraph" in body
-    assert "TVMTyphoonWaitGraph" in body
+def _count_marker_in_ffi_bodies(source, marker):
+    return sum(body.count(marker) for body in _extract_ffi_function_bodies(source).values())
+
+
+def _assert_graphized_function_has_no_host_fallback(body, *required_markers, require_submission=True):
+    if require_submission:
+        assert "TVMTyphoonGraphBegin" in body
+        assert "TVMTyphoonSubmitGraph" in body
+        assert "TVMTyphoonWaitGraph" in body
     for marker in required_markers:
         assert marker in body
     assert "for (" not in body
@@ -219,21 +224,49 @@ def test_typhoon_resnet18_graphized_conv_codegen_stays_graph_only():
     mod = tvm.tirx.transform.IdentifyTyphoonResNet18()(mod)
     mod = tvm.tirx.transform.PlanTyphoonSRAM()(mod)
     mod = tvm.tirx.transform.BuildTyphoonGraph()(mod)
+    text = mod.script()
+    assert text.count("T.typhoon.submit_graph") == 1
 
     for name in ["conv2d", "conv2d1", "conv2d4"]:
         text = mod[name].script()
-        assert "T.typhoon.task_reshape" in text
-        assert "T.typhoon.task_matmul" in text
+        assert "TVMTyphoonCaptureCallPlanned" in text
+        assert "T.typhoon.task_reshape" not in text
 
-    ffi_bodies = _extract_ffi_function_bodies(_inspect_source(mod))
+    source = _inspect_source(mod)
+    assert _count_marker_in_ffi_bodies(source, "TVMTyphoonGraphBegin") == 1
+    assert _count_marker_in_ffi_bodies(source, "TVMTyphoonSubmitGraph") == 1
+    assert _count_marker_in_ffi_bodies(source, "TVMTyphoonWaitGraph") == 1
+    ffi_bodies = _extract_ffi_function_bodies(source)
+    graph_entry_bodies = [body for body in ffi_bodies.values() if "TVMTyphoonGraphBegin" in body]
+    assert len(graph_entry_bodies) == 1
+    _assert_graphized_function_has_no_host_fallback(graph_entry_bodies[0])
     for name in ["conv2d", "conv2d1", "conv2d4"]:
         body = ffi_bodies[name]
-        if "TVMTyphoonGraphBegin" in body:
-            _assert_graphized_function_has_no_host_fallback(
-                body,
-                "TVMTyphoonAddReshapeTask",
-                "TVMTyphoonAddMatmulTask",
-            )
+        assert "TVMTyphoonCaptureCallPlanned" in body
+        assert "TVMTyphoonAddReshapeTask" not in body
+    assert "TVMTyphoonCapturePackedArgsPlanned" in ffi_bodies["add9"]
+    assert "TVMTyphoonReplayWholeGraphBegin" in ffi_bodies["add9"]
+    assert "TVMTyphoonReplayCapturedLayer" in ffi_bodies["add9"]
+    assert "TVMTyphoonCaptureCallPlanned" not in ffi_bodies["add9"]
+    assert "TVMTyphoonAddReshapeTask" not in ffi_bodies["add9"]
+    assert "TVMTyphoonAddMatmulTask" not in ffi_bodies["add9"]
+    assert "for (" not in ffi_bodies["add9"]
+
+
+def test_typhoon_resnet18_final_codegen_uses_replay_helpers():
+    mod = build_targeted_canonical_resnet18_tir_module()
+    source = _inspect_source(mod)
+    ffi_bodies = _extract_ffi_function_bodies(source)
+    final_body = ffi_bodies["add9"]
+
+    assert "TVMTyphoonCapturePackedArgsPlanned" in final_body
+    assert "TVMTyphoonReplayWholeGraphBegin" in final_body
+    assert "TVMTyphoonReplayCapturedLayer" in final_body
+    assert "TVMTyphoonCaptureCallPlanned" not in final_body
+    assert "TVMTyphoonAddDMATask" not in final_body
+    assert "TVMTyphoonAddReshapeTask" not in final_body
+    assert "TVMTyphoonAddMatmulTask" not in final_body
+    assert "TVMTyphoonAddVectorTask" not in final_body
 
 
 def test_typhoon_invalid_sram_usage_raises_clear_error():

@@ -44,6 +44,11 @@ class TyphoonGraphBuilder {
                   int64_t global_byte_offset, int32_t sram_region_id,
                   int64_t sram_byte_offset, int64_t bytes, int32_t num_deps,
                   const int32_t* dep_ids);
+  void AddBatchedDMATask(int32_t task_id, int32_t direction, void* global_handle,
+                         int64_t global_byte_offset, int64_t global_stride,
+                         int32_t sram_region_id, int64_t sram_byte_offset,
+                         int64_t sram_stride, int64_t bytes, int64_t batch_count,
+                         int32_t num_deps, const int32_t* dep_ids);
   void AddMatmulTask(int32_t task_id, int32_t a_region_id, int32_t b_region_id,
                      int32_t c_region_id, int64_t m, int64_t n, int64_t k, int32_t dtype_code,
                      int32_t layout_code, int32_t num_deps, const int32_t* dep_ids);

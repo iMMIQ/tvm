@@ -68,6 +68,27 @@ class CodeGenTyphoonHost final : public CodeGenCHost {
     } else if (global_symbol == "TVMTyphoonAddReshapeTask") {
       signature = "int32_t TVMTyphoonAddReshapeTask(int32_t, int32_t, int32_t, int32_t, int64_t, "
                   "int32_t, int32_t, void*, int32_t, void*)";
+    } else if (global_symbol == "TVMTyphoonCaptureCall") {
+      signature = "int32_t TVMTyphoonCaptureCall(int32_t, int32_t, void*, void*, void*)";
+    } else if (global_symbol == "TVMTyphoonCaptureCallAt") {
+      signature = "int32_t TVMTyphoonCaptureCallAt(int32_t, int32_t, int32_t, void*, void*, "
+                  "void*)";
+    } else if (global_symbol == "TVMTyphoonCaptureCallPlanned") {
+      signature = "int32_t TVMTyphoonCaptureCallPlanned(int32_t, const char*, int32_t, void*, "
+                  "void*, void*)";
+    } else if (global_symbol == "TVMTyphoonCapturePackedArgs") {
+      signature = "int32_t TVMTyphoonCapturePackedArgs(int32_t, void*, int32_t)";
+    } else if (global_symbol == "TVMTyphoonCapturePackedArgsAt") {
+      signature = "int32_t TVMTyphoonCapturePackedArgsAt(int32_t, int32_t, void*, int32_t)";
+    } else if (global_symbol == "TVMTyphoonCapturePackedArgsPlanned") {
+      signature = "int32_t TVMTyphoonCapturePackedArgsPlanned(int32_t, const char*, void*, "
+                  "int32_t)";
+    } else if (global_symbol == "TVMTyphoonGetCapturedHandle") {
+      signature = "void* TVMTyphoonGetCapturedHandle(int32_t, int32_t, int32_t)";
+    } else if (global_symbol == "TVMTyphoonReplayWholeGraphBegin") {
+      signature = "int32_t TVMTyphoonReplayWholeGraphBegin(int32_t)";
+    } else if (global_symbol == "TVMTyphoonReplayCapturedLayer") {
+      signature = "int32_t TVMTyphoonReplayCapturedLayer(int32_t, int32_t, int32_t)";
     } else if (global_symbol == "TVMTyphoonSubmitGraph") {
       signature = "int32_t TVMTyphoonSubmitGraph(int32_t)";
     } else if (global_symbol == "TVMTyphoonWaitGraph") {
