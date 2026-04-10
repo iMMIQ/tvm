@@ -33,6 +33,7 @@
 #include <regex>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -47,6 +48,7 @@ struct LayerInfo {
   std::vector<int64_t> logical_input_shape;
   std::vector<int64_t> logical_output_shape;
   std::vector<int64_t> weight_shape;
+  std::vector<int64_t> secondary_input_shape;
   bool requires_im2col{false};
 };
 
@@ -54,6 +56,47 @@ struct EdgeInfo {
   int64_t src_layer_id{0};
   int64_t dst_layer_id{0};
   std::string edge_kind;
+};
+
+struct StorageObject {
+  int64_t storage_id{0};
+  int64_t layer_id{0};
+  std::string role;
+  std::string region_class;
+  int64_t size{0};
+  int64_t alignment{0};
+  int64_t lifetime_start{0};
+  int64_t lifetime_end{0};
+};
+
+struct PlacementRegion {
+  int64_t region_id{0};
+  std::string name;
+  std::string region_class;
+  int64_t offset{0};
+  int64_t size{0};
+  int64_t alignment{0};
+};
+
+struct StoragePlacement {
+  int64_t storage_id{0};
+  int64_t region_id{0};
+  int64_t offset{0};
+};
+
+struct LayerOperandBinding {
+  int64_t layer_id{0};
+  int64_t input_storage_id{-1};
+  int64_t output_storage_id{-1};
+  int64_t weight_storage_id{-1};
+  int64_t secondary_input_storage_id{-1};
+  std::vector<int64_t> workspace_storage_ids;
+};
+
+struct StoragePlanState {
+  std::vector<StorageObject> objects;
+  std::vector<LayerOperandBinding> operand_bindings;
+  std::unordered_map<int64_t, int64_t> output_storage_by_layer_id;
 };
 
 struct RegionSpec {
@@ -218,6 +261,7 @@ std::vector<LayerInfo> ParseLayers(const std::string& plan) {
     layer.logical_input_shape = ExtractArray(object, "logical_input_shape");
     layer.logical_output_shape = ExtractArray(object, "logical_output_shape");
     TryExtractArray(object, "weight_shape", &layer.weight_shape);
+    TryExtractArray(object, "secondary_input_shape", &layer.secondary_input_shape);
     TryExtractBool(object, "requires_im2col", &layer.requires_im2col);
     layers.push_back(std::move(layer));
   }
@@ -265,6 +309,279 @@ int64_t ComputeIm2ColWorkingSet(const LayerInfo& layer) {
   return AlignUp(8 * in_channels * kernel_h * kernel_w * 4, kAlignment);
 }
 
+int64_t CanonicalRoleSize(const std::string& role) {
+  if (role == "input" || role == "output" || role == "secondary_input") {
+    return kActRegionSize;
+  }
+  if (role == "weight") {
+    return kWeightRegionSize;
+  }
+  if (role == "im2col_workspace") {
+    return kColRegionSize;
+  }
+  if (role == "accumulator_workspace") {
+    return kAuxRegionSize;
+  }
+  TVM_FFI_THROW(ValueError) << "PlanTyphoonSRAM does not recognize storage role `" << role << "`";
+  return 0;
+}
+
+std::string RegionClassForRole(const std::string& role) {
+  if (role == "input" || role == "output" || role == "secondary_input") {
+    return "activation";
+  }
+  if (role == "weight") {
+    return "weight";
+  }
+  if (role == "im2col_workspace") {
+    return "im2col_workspace";
+  }
+  if (role == "accumulator_workspace") {
+    return "accumulator_workspace";
+  }
+  TVM_FFI_THROW(ValueError) << "PlanTyphoonSRAM does not recognize storage role `" << role << "`";
+  return "";
+}
+
+bool MatchesShape(const std::vector<int64_t>& lhs, const std::vector<int64_t>& rhs) { return lhs == rhs; }
+
+std::string InferOutputRole(
+    const LayerInfo& layer, const std::unordered_map<int64_t, std::vector<EdgeInfo>>& outgoing_edges_by_src,
+    const std::unordered_map<int64_t, LayerInfo>& layers_by_id) {
+  auto outgoing_it = outgoing_edges_by_src.find(layer.layer_id);
+  if (outgoing_it == outgoing_edges_by_src.end()) {
+    return "output";
+  }
+  for (const EdgeInfo& edge : outgoing_it->second) {
+    auto consumer_it = layers_by_id.find(edge.dst_layer_id);
+    if (consumer_it == layers_by_id.end()) {
+      continue;
+    }
+    const LayerInfo& consumer = consumer_it->second;
+    if (!consumer.weight_shape.empty() &&
+        MatchesShape(layer.logical_output_shape, consumer.weight_shape)) {
+      return "weight";
+    }
+  }
+  return "output";
+}
+
+StoragePlanState BuildStoragePlanState(const std::vector<LayerInfo>& layers,
+                                       const std::vector<EdgeInfo>& edges) {
+  StoragePlanState state;
+  auto add_object = [&](int64_t layer_id, const std::string& role, int64_t lifetime_start,
+                        int64_t lifetime_end) -> int64_t {
+    int64_t storage_id = static_cast<int64_t>(state.objects.size());
+    state.objects.push_back(StorageObject{storage_id, layer_id, role, RegionClassForRole(role),
+                                          CanonicalRoleSize(role), kAlignment, lifetime_start,
+                                          lifetime_end});
+    return storage_id;
+  };
+
+  std::unordered_map<int64_t, LayerInfo> layers_by_id;
+  std::unordered_map<int64_t, std::vector<EdgeInfo>> incoming_edges_by_dst;
+  std::unordered_map<int64_t, std::vector<EdgeInfo>> outgoing_edges_by_src;
+  for (const LayerInfo& layer : layers) {
+    layers_by_id.emplace(layer.layer_id, layer);
+  }
+  for (const EdgeInfo& edge : edges) {
+    incoming_edges_by_dst[edge.dst_layer_id].push_back(edge);
+    outgoing_edges_by_src[edge.src_layer_id].push_back(edge);
+  }
+
+  for (const LayerInfo& layer : layers) {
+    int64_t lifetime_end = layer.layer_id;
+    auto outgoing_it = outgoing_edges_by_src.find(layer.layer_id);
+    if (outgoing_it != outgoing_edges_by_src.end()) {
+      for (const EdgeInfo& edge : outgoing_it->second) {
+        lifetime_end = std::max<int64_t>(lifetime_end, edge.dst_layer_id);
+      }
+    }
+    state.output_storage_by_layer_id[layer.layer_id] =
+        add_object(layer.layer_id, InferOutputRole(layer, outgoing_edges_by_src, layers_by_id),
+                   layer.layer_id, lifetime_end);
+  }
+
+  auto try_bind_internal_input = [&](const LayerInfo& layer, const std::vector<int64_t>& shape,
+                                     bool prefer_residual) -> int64_t {
+    auto incoming_it = incoming_edges_by_dst.find(layer.layer_id);
+    if (incoming_it == incoming_edges_by_dst.end()) {
+      return -1;
+    }
+    auto matches_preference = [&](const EdgeInfo& edge) {
+      bool is_residual = IsResidualEdge(edge);
+      return prefer_residual ? is_residual : !is_residual;
+    };
+    for (int pass = 0; pass < 2; ++pass) {
+      for (const EdgeInfo& edge : incoming_it->second) {
+        if ((pass == 0 && !matches_preference(edge)) || (pass == 1 && matches_preference(edge))) {
+          continue;
+        }
+        auto producer_it = layers_by_id.find(edge.src_layer_id);
+        if (producer_it == layers_by_id.end()) {
+          continue;
+        }
+        if (!MatchesShape(producer_it->second.logical_output_shape, shape)) {
+          continue;
+        }
+        auto storage_it = state.output_storage_by_layer_id.find(edge.src_layer_id);
+        if (storage_it != state.output_storage_by_layer_id.end()) {
+          return storage_it->second;
+        }
+      }
+    }
+    return -1;
+  };
+
+  auto try_bind_internal_weight = [&](const LayerInfo& layer) -> int64_t {
+    if (layer.weight_shape.empty()) {
+      return -1;
+    }
+    auto incoming_it = incoming_edges_by_dst.find(layer.layer_id);
+    if (incoming_it == incoming_edges_by_dst.end()) {
+      return -1;
+    }
+    for (const EdgeInfo& edge : incoming_it->second) {
+      auto producer_it = layers_by_id.find(edge.src_layer_id);
+      if (producer_it == layers_by_id.end()) {
+        continue;
+      }
+      if (!MatchesShape(producer_it->second.logical_output_shape, layer.weight_shape)) {
+        continue;
+      }
+      auto storage_it = state.output_storage_by_layer_id.find(edge.src_layer_id);
+      if (storage_it != state.output_storage_by_layer_id.end()) {
+        return storage_it->second;
+      }
+    }
+    return -1;
+  };
+
+  for (const LayerInfo& layer : layers) {
+    LayerOperandBinding binding;
+    binding.layer_id = layer.layer_id;
+    binding.output_storage_id = state.output_storage_by_layer_id.at(layer.layer_id);
+
+    int64_t input_storage_id = try_bind_internal_input(layer, layer.logical_input_shape, false);
+    if (input_storage_id < 0) {
+      input_storage_id = add_object(layer.layer_id, "input", layer.layer_id, layer.layer_id);
+    }
+    binding.input_storage_id = input_storage_id;
+
+    if (layer.kind == "add" || layer.kind == "bias_add" || layer.kind == "residual_add") {
+      int64_t secondary_storage_id = -1;
+      if (!layer.secondary_input_shape.empty()) {
+        secondary_storage_id =
+            try_bind_internal_input(layer, layer.secondary_input_shape, true);
+      }
+      if (secondary_storage_id < 0) {
+        secondary_storage_id =
+            add_object(layer.layer_id, "secondary_input", layer.layer_id, layer.layer_id);
+      }
+      binding.secondary_input_storage_id = secondary_storage_id;
+    }
+    if (!layer.weight_shape.empty()) {
+      int64_t weight_storage_id = try_bind_internal_weight(layer);
+      if (weight_storage_id < 0) {
+        weight_storage_id = add_object(layer.layer_id, "weight", layer.layer_id, layer.layer_id);
+      }
+      binding.weight_storage_id = weight_storage_id;
+    }
+    if (layer.requires_im2col) {
+      binding.workspace_storage_ids.push_back(
+          add_object(layer.layer_id, "im2col_workspace", layer.layer_id, layer.layer_id));
+      binding.workspace_storage_ids.push_back(
+          add_object(layer.layer_id, "accumulator_workspace", layer.layer_id, layer.layer_id));
+    }
+    state.operand_bindings.push_back(std::move(binding));
+  }
+  return state;
+}
+
+std::vector<StoragePlacement> BuildStoragePlacements(const std::vector<StorageObject>& objects,
+                                                     std::vector<PlacementRegion>* regions) {
+  struct ActiveAssignment {
+    int64_t lifetime_end{0};
+    int64_t region_id{0};
+  };
+  struct RegionState {
+    PlacementRegion region;
+    std::vector<ActiveAssignment> active;
+  };
+
+  std::unordered_map<std::string, std::vector<RegionState>> states_by_class;
+  std::vector<StoragePlacement> placements;
+  int64_t next_region_id = 0;
+
+  std::vector<StorageObject> sorted = objects;
+  std::sort(sorted.begin(), sorted.end(),
+            [](const StorageObject& lhs, const StorageObject& rhs) {
+              if (lhs.lifetime_start != rhs.lifetime_start) {
+                return lhs.lifetime_start < rhs.lifetime_start;
+              }
+              if (lhs.lifetime_end != rhs.lifetime_end) {
+                return lhs.lifetime_end < rhs.lifetime_end;
+              }
+              return lhs.storage_id < rhs.storage_id;
+            });
+
+  for (const StorageObject& object : sorted) {
+    auto& states = states_by_class[object.region_class];
+    RegionState* chosen = nullptr;
+    for (auto& state : states) {
+      state.active.erase(std::remove_if(state.active.begin(), state.active.end(),
+                                        [&](const ActiveAssignment& active) {
+                                          return active.lifetime_end < object.lifetime_start;
+                                        }),
+                         state.active.end());
+      if (state.active.empty()) {
+        chosen = &state;
+        break;
+      }
+    }
+    if (chosen == nullptr) {
+      PlacementRegion region;
+      region.region_id = next_region_id++;
+      region.name = object.region_class + "_slot" + std::to_string(states.size());
+      region.region_class = object.region_class;
+      region.offset = 0;
+      region.size = object.size;
+      region.alignment = object.alignment;
+      states.push_back(RegionState{region, {}});
+      chosen = &states.back();
+    }
+    chosen->region.size = std::max(chosen->region.size, object.size);
+    chosen->region.alignment = std::max(chosen->region.alignment, object.alignment);
+    chosen->active.push_back(ActiveAssignment{object.lifetime_end, chosen->region.region_id});
+    placements.push_back(StoragePlacement{object.storage_id, chosen->region.region_id, 0});
+  }
+
+  int64_t next_offset = 0;
+  std::vector<std::string> region_classes;
+  region_classes.reserve(states_by_class.size());
+  for (const auto& [region_class, states] : states_by_class) {
+    region_classes.push_back(region_class);
+  }
+  std::sort(region_classes.begin(), region_classes.end());
+  for (const std::string& region_class : region_classes) {
+    auto& states = states_by_class.at(region_class);
+    for (auto& state : states) {
+      state.region.offset = AlignUp(next_offset, state.region.alignment);
+      next_offset = state.region.offset + state.region.size;
+      regions->push_back(state.region);
+    }
+  }
+  std::sort(regions->begin(), regions->end(),
+            [](const PlacementRegion& lhs, const PlacementRegion& rhs) {
+              return lhs.region_id < rhs.region_id;
+            });
+  std::sort(placements.begin(), placements.end(),
+            [](const StoragePlacement& lhs, const StoragePlacement& rhs) {
+              return lhs.storage_id < rhs.storage_id;
+            });
+  return placements;
+}
+
 void AppendIntArray(std::ostringstream& os, const std::vector<int64_t>& values) {
   os << "[";
   for (size_t i = 0; i < values.size(); ++i) {
@@ -288,6 +605,11 @@ void AppendStringArray(std::ostringstream& os, const std::vector<std::string>& v
 }
 
 ffi::String BuildSRAMPlanJSON(const std::vector<LayerInfo>& layers, const std::vector<EdgeInfo>& edges) {
+  StoragePlanState storage_plan = BuildStoragePlanState(layers, edges);
+  const std::vector<StorageObject>& storage_objects = storage_plan.objects;
+  std::vector<PlacementRegion> placement_regions;
+  std::vector<StoragePlacement> placements = BuildStoragePlacements(storage_objects, &placement_regions);
+  const std::vector<LayerOperandBinding>& operand_bindings = storage_plan.operand_bindings;
   std::ostringstream os;
   os << "{"
      << "\"matmul_tile\":[64,64,64],"
@@ -312,6 +634,50 @@ ffi::String BuildSRAMPlanJSON(const std::vector<LayerInfo>& layers, const std::v
        << "\"offset\":" << region.offset << ","
        << "\"size\":" << region.size << ","
        << "\"alignment\":" << region.alignment << "}";
+  }
+  os << "],"
+     << "\"storage_objects\":[";
+  for (size_t i = 0; i < storage_objects.size(); ++i) {
+    if (i != 0) {
+      os << ",";
+    }
+    const StorageObject& object = storage_objects[i];
+    os << "{"
+       << "\"storage_id\":" << object.storage_id << ","
+       << "\"layer_id\":" << object.layer_id << ","
+       << "\"role\":\"" << object.role << "\","
+       << "\"region_class\":\"" << object.region_class << "\","
+       << "\"size\":" << object.size << ","
+       << "\"alignment\":" << object.alignment << ","
+       << "\"lifetime_start\":" << object.lifetime_start << ","
+       << "\"lifetime_end\":" << object.lifetime_end << "}";
+  }
+  os << "],"
+     << "\"placement_regions\":[";
+  for (size_t i = 0; i < placement_regions.size(); ++i) {
+    if (i != 0) {
+      os << ",";
+    }
+    const PlacementRegion& region = placement_regions[i];
+    os << "{"
+       << "\"region_id\":" << region.region_id << ","
+       << "\"name\":\"" << region.name << "\","
+       << "\"region_class\":\"" << region.region_class << "\","
+       << "\"offset\":" << region.offset << ","
+       << "\"size\":" << region.size << ","
+       << "\"alignment\":" << region.alignment << "}";
+  }
+  os << "],"
+     << "\"placements\":[";
+  for (size_t i = 0; i < placements.size(); ++i) {
+    if (i != 0) {
+      os << ",";
+    }
+    const StoragePlacement& placement = placements[i];
+    os << "{"
+       << "\"storage_id\":" << placement.storage_id << ","
+       << "\"region_id\":" << placement.region_id << ","
+       << "\"offset\":" << placement.offset << "}";
   }
   os << "],"
      << "\"live_ranges\":[";
@@ -339,6 +705,27 @@ ffi::String BuildSRAMPlanJSON(const std::vector<LayerInfo>& layers, const std::v
       append_live_range(2, edge.src_layer_id, edge.dst_layer_id, "RESIDUAL",
                         {edge.src_layer_id + 1, edge.dst_layer_id});
     }
+  }
+  os << "],"
+     << "\"layer_operands\":[";
+  for (size_t i = 0; i < operand_bindings.size(); ++i) {
+    if (i != 0) {
+      os << ",";
+    }
+    const LayerOperandBinding& binding = operand_bindings[i];
+    os << "{"
+       << "\"layer_id\":" << binding.layer_id << ","
+       << "\"input_storage_id\":" << binding.input_storage_id << ","
+       << "\"output_storage_id\":" << binding.output_storage_id;
+    if (binding.weight_storage_id >= 0) {
+      os << ",\"weight_storage_id\":" << binding.weight_storage_id;
+    }
+    if (binding.secondary_input_storage_id >= 0) {
+      os << ",\"secondary_input_storage_id\":" << binding.secondary_input_storage_id;
+    }
+    os << ",\"workspace_storage_ids\":";
+    AppendIntArray(os, binding.workspace_storage_ids);
+    os << "}";
   }
   os << "],"
      << "\"layer_tiles\":[";

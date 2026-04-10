@@ -31,14 +31,31 @@ def test_typhoon_sram_plan_tracks_full_graph_live_ranges():
     out = tvm.tirx.transform.PlanTyphoonSRAM()(mod)
     plan = json.loads(out.attrs["typhoon_sram_plan"])
     assert any(region["name"] == "residual" for region in plan["regions"])
+    assert any(region["name"].startswith("activation_slot") for region in plan["placement_regions"])
     assert all(
         "offset" in region and "size" in region and "alignment" in region
         for region in plan["regions"]
+    )
+    assert all(
+        {"storage_id", "role", "region_class", "lifetime_start", "lifetime_end"} <= item.keys()
+        for item in plan["storage_objects"]
+    )
+    assert all({"storage_id", "region_id", "offset"} <= item.keys() for item in plan["placements"])
+    assert all(
+        {"layer_id", "input_storage_id", "output_storage_id", "workspace_storage_ids"} <= item.keys()
+        for item in plan["layer_operands"]
     )
     assert any(item["last_use_layer_id"] > item["producer_layer_id"] for item in plan["live_ranges"])
     assert any(
         "consumer_window" in item and "reuse_after_layer_id" in item for item in plan["live_ranges"]
     )
+    output_storage_by_layer = {
+        item["layer_id"]: item["output_storage_id"] for item in plan["layer_operands"]
+    }
+    operand_by_layer = {item["layer_id"]: item for item in plan["layer_operands"]}
+    assert operand_by_layer[1]["input_storage_id"] == output_storage_by_layer[0]
+    assert operand_by_layer[9]["secondary_input_storage_id"] == output_storage_by_layer[3]
+    assert operand_by_layer[68]["weight_storage_id"] == output_storage_by_layer[67]
     assert plan["peak_live_bytes"] <= 1024 * 1024
 
 
@@ -47,7 +64,7 @@ def test_typhoon_sram_plan_regions_are_in_bounds_and_non_overlapping():
     out = tvm.tirx.transform.PlanTyphoonSRAM()(mod)
     plan = json.loads(out.attrs["typhoon_sram_plan"])
     spans = []
-    for region in plan["regions"]:
+    for region in plan["placement_regions"]:
         assert region["offset"] >= 0
         assert region["size"] > 0
         assert region["offset"] + region["size"] <= 1024 * 1024

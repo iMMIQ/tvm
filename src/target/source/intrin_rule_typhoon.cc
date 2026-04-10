@@ -51,6 +51,10 @@ TVM_REGISTER_OP("tirx.typhoon.task_dma")
     .set_attr<FLowerIntrinsic>("typhoon.FLowerIntrinsic",
                                LowerToTyphoonExternCall("TVMTyphoonAddDMATask"));
 
+TVM_REGISTER_OP("tirx.typhoon.task_batched_dma")
+    .set_attr<FLowerIntrinsic>("typhoon.FLowerIntrinsic",
+                               LowerToTyphoonExternCall("TVMTyphoonAddBatchedDMATask"));
+
 TVM_REGISTER_OP("tirx.typhoon.task_matmul")
     .set_attr<FLowerIntrinsic>("typhoon.FLowerIntrinsic",
                                LowerToTyphoonExternCall("TVMTyphoonAddMatmulTask"));

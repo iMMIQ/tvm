@@ -39,6 +39,8 @@ class TyphoonSubmitGraphLowerer : public StmtExprMutator {
  public:
   using Parent = StmtExprMutator;
 
+  std::optional<PrimExpr> graph_id() const { return graph_id_; }
+
   Stmt VisitStmt_(const EvaluateNode* op) final {
     Stmt stmt = Parent::VisitStmt_(op);
     const auto* eval = stmt.as<EvaluateNode>();
@@ -50,16 +52,17 @@ class TyphoonSubmitGraphLowerer : public StmtExprMutator {
       return stmt;
     }
     TVM_FFI_ICHECK_EQ(call->args.size(), 1U) << "tirx.typhoon.submit_graph expects graph_id only";
+    if (!graph_id_.has_value()) {
+      graph_id_ = call->args[0];
+    }
 
-    ffi::Array<PrimExpr> begin_args{StringImm("TVMTyphoonGraphBegin")};
-    begin_args.push_back(call->args[0]);
-    PrimExpr begin_call = Call(eval->value.dtype(), builtin::call_extern(), begin_args);
     ffi::Array<PrimExpr> submit_args{StringImm("TVMTyphoonSubmitGraph"), call->args[0]};
     PrimExpr submit_call = Call(eval->value.dtype(), builtin::call_extern(), submit_args);
-    return SeqStmt({Evaluate(begin_call, op->span), Evaluate(submit_call, op->span)}, op->span);
+    return Evaluate(submit_call, op->span);
   }
 
  private:
+  std::optional<PrimExpr> graph_id_;
   const Op& submit_graph_op_ = Op::Get("tirx.typhoon.submit_graph");
 };
 
@@ -71,8 +74,23 @@ Pass LowerTyphoonSubmitGraph() {
     if (!target.defined() || target.value()->kind->name != "typhoon") {
       return f;
     }
+    TyphoonSubmitGraphLowerer lowerer;
     auto* n = f.CopyOnWrite();
-    n->body = TyphoonSubmitGraphLowerer()(std::move(n->body));
+    n->body = lowerer(std::move(n->body));
+    if (lowerer.graph_id().has_value()) {
+      ffi::Array<PrimExpr> begin_args{StringImm("TVMTyphoonGraphBegin"), lowerer.graph_id().value()};
+      Stmt begin_stmt = Evaluate(Call(DataType::Int(32), builtin::call_extern(), begin_args));
+      if (const auto* seq = n->body.as<SeqStmtNode>()) {
+        ffi::Array<Stmt> stmts;
+        stmts.push_back(begin_stmt);
+        for (const Stmt& stmt : seq->seq) {
+          stmts.push_back(stmt);
+        }
+        n->body = SeqStmt(stmts, seq->span);
+      } else {
+        n->body = SeqStmt({begin_stmt, n->body});
+      }
+    }
     return f;
   };
   return CreatePrimFuncPass(pass_func, 0, "tirx.LowerTyphoonSubmitGraph", {});

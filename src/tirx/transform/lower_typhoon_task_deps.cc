@@ -59,6 +59,9 @@ class TyphoonTaskDepLowerer : public StmtExprMutator {
     if (call->op.same_as(task_dma_op_)) {
       return LowerTask(call, /*num_deps_index=*/8, "TVMTyphoonAddDMATask", op->span);
     }
+    if (call->op.same_as(task_batched_dma_op_)) {
+      return LowerTask(call, /*num_deps_index=*/11, "TVMTyphoonAddBatchedDMATask", op->span);
+    }
     if (call->op.same_as(task_matmul_op_)) {
       return LowerTask(call, /*num_deps_index=*/10, "TVMTyphoonAddMatmulTask", op->span);
     }
@@ -183,6 +186,7 @@ class TyphoonTaskDepLowerer : public StmtExprMutator {
 
   int counter_{0};
   const Op& task_dma_op_ = Op::Get("tirx.typhoon.task_dma");
+  const Op& task_batched_dma_op_ = Op::Get("tirx.typhoon.task_batched_dma");
   const Op& task_matmul_op_ = Op::Get("tirx.typhoon.task_matmul");
   const Op& task_vector_op_ = Op::Get("tirx.typhoon.task_vector");
   const Op& task_reshape_op_ = Op::Get("tirx.typhoon.task_reshape");

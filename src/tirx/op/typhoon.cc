@@ -33,6 +33,7 @@ namespace tirx {
 
 TVM_TIR_REGISTER_TYPHOON_OP("region_decl").set_num_inputs(7);
 TVM_TIR_REGISTER_TYPHOON_OP("task_dma");
+TVM_TIR_REGISTER_TYPHOON_OP("task_batched_dma");
 TVM_TIR_REGISTER_TYPHOON_OP("task_matmul");
 TVM_TIR_REGISTER_TYPHOON_OP("task_vector");
 TVM_TIR_REGISTER_TYPHOON_OP("task_reshape");

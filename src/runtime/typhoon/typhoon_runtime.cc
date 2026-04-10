@@ -454,6 +454,7 @@ struct CanonicalReplayState {
   bool initialized{false};
   int32_t next_task_id{0};
   std::vector<int32_t> prev_segment_deps;
+  std::unordered_set<int32_t> skipped_layer_ids;
 };
 
 struct GraphRuntimeState {
@@ -483,9 +484,15 @@ class TyphoonRuntimeState {
   void ResetForTesting() {
     std::lock_guard<std::mutex> lock(mu_);
     graphs_.clear();
+    keep_graph_state_for_testing_ = false;
     last_error_.clear();
     last_trace_json_ = "[]";
     last_graph_stats_json_ = "{}";
+  }
+
+  void SetKeepGraphStateForTesting(bool keep) {
+    std::lock_guard<std::mutex> lock(mu_);
+    keep_graph_state_for_testing_ = keep;
   }
 
   std::string LastError() const {
@@ -523,6 +530,19 @@ class TyphoonRuntimeState {
       GetOrCreateGraph(graph_id)
           .AddDMATask(task_id, direction, global_handle, global_byte_offset, sram_region_id,
                       sram_byte_offset, bytes, num_deps, dep_ids);
+    });
+  }
+
+  int AddBatchedDMATask(int32_t graph_id, int32_t task_id, int32_t direction, void* global_handle,
+                        int64_t global_byte_offset, int64_t global_stride,
+                        int32_t sram_region_id, int64_t sram_byte_offset, int64_t sram_stride,
+                        int64_t bytes, int64_t batch_count, int32_t num_deps,
+                        const int32_t* dep_ids) {
+    return Call([&]() {
+      GetOrCreateGraph(graph_id)
+          .AddBatchedDMATask(task_id, direction, global_handle, global_byte_offset, global_stride,
+                             sram_region_id, sram_byte_offset, sram_stride, bytes, batch_count,
+                             num_deps, dep_ids);
     });
   }
 
@@ -650,6 +670,31 @@ class TyphoonRuntimeState {
     });
   }
 
+  void* GetCapturedTensorPtr(int32_t graph_id, int32_t layer_id, int32_t handle_index) {
+    return CallHandle([&]() -> void* {
+      if (handle_index < 0 || handle_index >= 3) {
+        throw std::runtime_error("Typhoon captured tensor index must be in [0, 2]");
+      }
+      auto it = graphs_.find(graph_id);
+      if (it == graphs_.end()) {
+        throw std::runtime_error("Typhoon graph " + std::to_string(graph_id) + " is unknown");
+      }
+      if (layer_id < 0 || layer_id >= static_cast<int32_t>(it->second.captured_calls.size())) {
+        throw std::runtime_error("Typhoon captured layer_id " + std::to_string(layer_id) +
+                                 " is out of range");
+      }
+      const CapturedCall& call = it->second.captured_calls[layer_id];
+      if (handle_index >= call.num_handles) {
+        throw std::runtime_error("Typhoon captured tensor index " + std::to_string(handle_index) +
+                                 " exceeds captured arity");
+      }
+      if (!call.present[handle_index]) {
+        throw std::runtime_error("Typhoon captured tensor is NULL");
+      }
+      return reinterpret_cast<void*>(const_cast<DLTensor*>(&call.handles[handle_index]));
+    });
+  }
+
   int ReplayWholeGraphBegin(int32_t graph_id) {
     return Call([&]() {
       auto& state = GetOrCreateState(graph_id);
@@ -666,6 +711,14 @@ class TyphoonRuntimeState {
     return Call([&]() {
       auto& state = GetOrCreateState(graph_id);
       EnsureReplayInitialized(state, graph_id);
+      if (state.replay.skipped_layer_ids.count(layer_id) != 0) {
+        return;
+      }
+      state.graph.SetCurrentLayerId(layer_id);
+      struct ResetCurrentLayerId {
+        TyphoonGraphBuilder* graph;
+        ~ResetCurrentLayerId() { graph->SetCurrentLayerId(-1); }
+      } reset_current_layer_id{&state.graph};
       switch (replay_kind) {
         case kReplayConv2D:
           ReplayConv2DLayer(&state, layer_id);
@@ -706,13 +759,28 @@ class TyphoonRuntimeState {
   }
 
   int WaitGraph(int32_t graph_id) {
+    if (!LastError().empty()) {
+      std::lock_guard<std::mutex> lock(mu_);
+      auto it = graphs_.find(graph_id);
+      if (it != graphs_.end()) {
+        try {
+          it->second.graph.Wait();
+        } catch (const std::exception&) {
+        }
+      }
+      return 0;
+    }
     return Call([&]() {
       auto it = graphs_.find(graph_id);
       if (it == graphs_.end()) {
         throw std::runtime_error("Typhoon graph " + std::to_string(graph_id) + " is unknown");
       }
       it->second.graph.Wait();
-      graphs_.erase(it);
+      if (keep_graph_state_for_testing_) {
+        it->second.graph = TyphoonGraphBuilder(graph_id);
+      } else {
+        graphs_.erase(it);
+      }
     });
   }
 
@@ -734,6 +802,38 @@ class TyphoonRuntimeState {
       elems *= tensor->shape[i];
     }
     return elems * (tensor->dtype.bits / 8) * tensor->dtype.lanes;
+  }
+
+  static bool SameShape(const DLTensor* lhs, const DLTensor* rhs) {
+    if (lhs->ndim != rhs->ndim) {
+      return false;
+    }
+    for (int i = 0; i < lhs->ndim; ++i) {
+      if (lhs->shape[i] != rhs->shape[i]) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  static bool IsContiguousBiasVector(const DLTensor* tensor, int64_t elements) {
+    if (tensor->dtype.code != kDLFloat || tensor->dtype.bits != 32 || tensor->dtype.lanes != 1) {
+      return false;
+    }
+    if (tensor->strides != nullptr) {
+      return false;
+    }
+    if (tensor->ndim == 1) {
+      return tensor->shape[0] == elements;
+    }
+    if (tensor->ndim == 2) {
+      return tensor->shape[0] == 1 && tensor->shape[1] == elements;
+    }
+    if (tensor->ndim == 4) {
+      return tensor->shape[0] == 1 && tensor->shape[1] == elements && tensor->shape[2] == 1 &&
+             tensor->shape[3] == 1;
+    }
+    return false;
   }
 
   static int64_t NCHWChannelOffsetBytes(int64_t channel, int64_t h_offset, int64_t height,
@@ -1128,6 +1228,7 @@ class TyphoonRuntimeState {
   static void ReplayDenseMatmulLayer(GraphRuntimeState* state, int32_t layer_id) {
     const CanonicalRegionSpec& act0 = FindCanonicalRegion("act0");
     const CanonicalRegionSpec& act1 = FindCanonicalRegion("act1");
+    const CanonicalRegionSpec& residual = FindCanonicalRegion("residual");
     const CanonicalRegionSpec& wgt0 = FindCanonicalRegion("wgt0");
     const DLTensor* input = GetCapturedTensor(*state, layer_id, 0);
     const DLTensor* weight = GetCapturedTensor(*state, layer_id, 1);
@@ -1156,6 +1257,21 @@ class TyphoonRuntimeState {
     int64_t n_total = output_shape[1];
     int64_t n_chunk = std::max<int64_t>(1, wgt0.size / (k * 4));
     n_chunk = std::min<int64_t>(n_chunk, n_total);
+    const DLTensor* fused_bias = nullptr;
+    const DLTensor* fused_output = output;
+    int32_t fused_layer_id = -1;
+    if (layer_id + 1 < static_cast<int32_t>(state->captured_calls.size()) &&
+        state->replay.skipped_layer_ids.count(layer_id + 1) == 0) {
+      const DLTensor* next_lhs = GetCapturedTensor(*state, layer_id + 1, 0);
+      const DLTensor* next_rhs = GetCapturedTensor(*state, layer_id + 1, 1);
+      const DLTensor* next_out = GetCapturedTensor(*state, layer_id + 1, 2);
+      if (next_lhs->data == output->data && SameShape(next_lhs, output) &&
+          SameShape(next_out, output) && IsContiguousBiasVector(next_rhs, n_total)) {
+        fused_bias = next_rhs;
+        fused_output = next_out;
+        fused_layer_id = layer_id + 1;
+      }
+    }
     std::vector<int32_t> carry_deps = state->replay.prev_segment_deps;
     for (int64_t n_offset = 0; n_offset < n_total; n_offset += n_chunk) {
       int64_t n = std::min<int64_t>(n_chunk, n_total - n_offset);
@@ -1166,12 +1282,24 @@ class TyphoonRuntimeState {
           AddDMATaskReturningId(state, 0, input->data, 0, act0.region_id, k * 4, carry_deps);
       int32_t dma_weight = AddDMATaskReturningId(state, 0, weight->data, weight_offset,
                                                  wgt0.region_id, weight_bytes, carry_deps);
-      int32_t matmul =
-          AddMatmulTask(state, act0.region_id, wgt0.region_id, act1.region_id, 1, n, k, 1,
-                        {dma_input, dma_weight});
-      int32_t dma_out = AddDMATaskReturningId(state, 1, output->data, n_offset * 4, act1.region_id,
-                                             output_bytes, {matmul});
+      int32_t matmul = AddMatmulTask(state, act0.region_id, wgt0.region_id, act1.region_id, 1, n, k, 1,
+                                     {dma_input, dma_weight});
+      int32_t dma_out = -1;
+      if (fused_bias != nullptr) {
+        int32_t dma_bias = AddDMATaskReturningId(state, 0, fused_bias->data, n_offset * 4,
+                                                 residual.region_id, output_bytes, carry_deps);
+        int32_t vector = AddVectorTask(state, 0, act1.region_id, residual.region_id, act0.region_id,
+                                       n, {}, {matmul, dma_bias});
+        dma_out = AddDMATaskReturningId(state, 1, fused_output->data, n_offset * 4, act0.region_id,
+                                        output_bytes, {vector});
+      } else {
+        dma_out = AddDMATaskReturningId(state, 1, output->data, n_offset * 4, act1.region_id,
+                                        output_bytes, {matmul});
+      }
       carry_deps = {dma_out};
+    }
+    if (fused_layer_id >= 0) {
+      state->replay.skipped_layer_ids.insert(fused_layer_id);
     }
     state->replay.prev_segment_deps = std::move(carry_deps);
   }
@@ -1224,8 +1352,8 @@ class TyphoonRuntimeState {
       int64_t input_plane_bytes = NCHWChannelPlaneBytes(input_h_tile, in_w);
       int32_t input_dma = AddBatchedDMATaskReturningId(
           state, 0, input->data, NCHWChannelOffsetBytes(0, input_h_start, in_h, in_w),
-          NCHWChannelPlaneBytes(in_h, in_w), act0.region_id, 0, input_plane_bytes, input_plane_bytes,
-          in_channels, carry_deps);
+          NCHWChannelPlaneBytes(in_h, in_w), act0.region_id, 0, input_plane_bytes,
+          input_plane_bytes, in_channels, carry_deps);
       int64_t rows = current_out_h_tile * out_w;
       max_output_channels = aux0.size / (rows * 4);
       int64_t out_channel_chunk =
@@ -1339,6 +1467,7 @@ class TyphoonRuntimeState {
 
   mutable std::mutex mu_;
   std::unordered_map<int32_t, GraphRuntimeState> graphs_;
+  bool keep_graph_state_for_testing_{false};
   std::string last_error_;
   std::string last_trace_json_{"[]"};
   std::string last_graph_stats_json_{"{}"};
@@ -1366,6 +1495,17 @@ extern "C" int TVMTyphoonAddDMATask(int32_t graph_id, int32_t task_id, int32_t d
   return tvm::runtime::typhoon::TyphoonRuntimeState::Global().AddDMATask(
       graph_id, task_id, direction, global_handle, global_byte_offset, sram_region_id,
       sram_byte_offset, bytes, num_deps, dep_ids);
+}
+
+extern "C" int TVMTyphoonAddBatchedDMATask(int32_t graph_id, int32_t task_id, int32_t direction,
+                                           void* global_handle, int64_t global_byte_offset,
+                                           int64_t global_stride, int32_t sram_region_id,
+                                           int64_t sram_byte_offset, int64_t sram_stride,
+                                           int64_t bytes, int64_t batch_count, int32_t num_deps,
+                                           const int32_t* dep_ids) {
+  return tvm::runtime::typhoon::TyphoonRuntimeState::Global().AddBatchedDMATask(
+      graph_id, task_id, direction, global_handle, global_byte_offset, global_stride,
+      sram_region_id, sram_byte_offset, sram_stride, bytes, batch_count, num_deps, dep_ids);
 }
 
 extern "C" int TVMTyphoonAddMatmulTask(int32_t graph_id, int32_t task_id, int32_t a_region_id,
@@ -1441,6 +1581,12 @@ extern "C" void* TVMTyphoonGetCapturedHandle(int32_t graph_id, int32_t layer_id,
       graph_id, layer_id, handle_index);
 }
 
+extern "C" void* TVMTyphoonGetCapturedTensorPtr(int32_t graph_id, int32_t layer_id,
+                                                int32_t handle_index) {
+  return tvm::runtime::typhoon::TyphoonRuntimeState::Global().GetCapturedTensorPtr(
+      graph_id, layer_id, handle_index);
+}
+
 extern "C" int TVMTyphoonReplayWholeGraphBegin(int32_t graph_id) {
   return tvm::runtime::typhoon::TyphoonRuntimeState::Global().ReplayWholeGraphBegin(graph_id);
 }
@@ -1467,6 +1613,8 @@ TVM_FFI_STATIC_INIT_BLOCK() {
   namespace refl = tvm::ffi::reflection;
   refl::GlobalDef().def("runtime.typhoon.testing_reset",
                         []() { TyphoonRuntimeState::Global().ResetForTesting(); });
+  refl::GlobalDef().def("runtime.typhoon.testing_keep_graph_state",
+                        [](bool keep) { TyphoonRuntimeState::Global().SetKeepGraphStateForTesting(keep); });
   refl::GlobalDef().def("runtime.typhoon.testing_last_error",
                         []() { return TyphoonRuntimeState::Global().LastError(); });
   refl::GlobalDef().def("runtime.typhoon_get_last_trace_json",

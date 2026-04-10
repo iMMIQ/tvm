@@ -55,6 +55,7 @@ struct TyphoonRegion {
 struct TyphoonTask {
   TaskKind kind{TaskKind::kDMA};
   int32_t task_id{0};
+  int32_t layer_id{-1};
   std::vector<int32_t> deps;
   std::vector<int32_t> reads;
   std::vector<int32_t> writes;
@@ -78,6 +79,7 @@ struct TyphoonTask {
 
 struct TyphoonTraceRecord {
   int32_t task_id{0};
+  int32_t layer_id{-1};
   std::string kind;
   std::string resource;
   int64_t start_time{0};

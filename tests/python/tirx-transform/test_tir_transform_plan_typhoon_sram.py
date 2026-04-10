@@ -46,6 +46,13 @@ def test_typhoon_sram_plan_uses_fixed_f32_tiles():
     assert plan["matmul_tile"] == [64, 64, 64]
     assert plan["tile"]["m0"] == 8
     assert plan["regions"][0]["name"] == "act0"
+    assert plan["storage_objects"]
+    assert plan["placement_regions"]
+    assert plan["placements"]
+    assert plan["layer_operands"]
+    assert any(obj["role"] == "input" for obj in plan["storage_objects"])
+    assert any(region["name"].startswith("activation_slot") for region in plan["placement_regions"])
+    assert all(item["offset"] == 0 for item in plan["placements"])
 
 
 def test_typhoon_sram_plan_rejects_tile_overflow():

@@ -59,6 +59,10 @@ class CodeGenTyphoonHost final : public CodeGenCHost {
     } else if (global_symbol == "TVMTyphoonAddDMATask") {
       signature = "int32_t TVMTyphoonAddDMATask(int32_t, int32_t, int32_t, void*, int64_t, "
                   "int32_t, int64_t, int64_t, int32_t, void*)";
+    } else if (global_symbol == "TVMTyphoonAddBatchedDMATask") {
+      signature =
+          "int32_t TVMTyphoonAddBatchedDMATask(int32_t, int32_t, int32_t, void*, int64_t, "
+          "int64_t, int32_t, int64_t, int64_t, int64_t, int64_t, int32_t, void*)";
     } else if (global_symbol == "TVMTyphoonAddMatmulTask") {
       signature = "int32_t TVMTyphoonAddMatmulTask(int32_t, int32_t, int32_t, int32_t, int32_t, "
                   "int64_t, int64_t, int64_t, int32_t, int32_t, int32_t, void*)";

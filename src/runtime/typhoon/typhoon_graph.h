@@ -38,6 +38,7 @@ class TyphoonGraphBuilder {
   explicit TyphoonGraphBuilder(int32_t graph_id);
 
   void GraphBegin();
+  void SetCurrentLayerId(int32_t layer_id);
   void DeclareRegion(int32_t region_id, int64_t offset, int64_t size, int64_t alignment,
                      bool preinitialized, const char* tag);
   void AddDMATask(int32_t task_id, int32_t direction, void* global_handle,
@@ -84,6 +85,7 @@ class TyphoonGraphBuilder {
   const std::unordered_set<int32_t>& BuildAncestors(size_t task_index);
 
   int32_t graph_id_;
+  int32_t current_layer_id_{-1};
   bool began_{false};
   bool submitted_{false};
   std::vector<TyphoonRegion> regions_;

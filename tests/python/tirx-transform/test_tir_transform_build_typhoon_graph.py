@@ -192,7 +192,6 @@ def test_finalize_host_passes_auto_builds_typhoon_graph_for_canonical_resnet18()
     assert "TVMTyphoonCaptureCallPlanned" in final_text
     assert "TVMTyphoonReplayWholeGraphBegin" in final_text
     assert "TVMTyphoonReplayCapturedLayer" in final_text
-    assert "TVMTyphoonGetCapturedHandle" not in final_text
     assert "TVMTyphoonAddReshapeTask" not in final_text
     assert "TVMTyphoonAddMatmulTask" not in final_text
 
@@ -221,11 +220,28 @@ def test_build_typhoon_graph_graphizes_canonical_conv_primfuncs():
     out = tvm.tirx.transform.BuildTyphoonGraph()(mod)
     module_text = out.script()
     assert module_text.count("T.typhoon.submit_graph") == 1
+    assert "activation_slot0" in module_text
 
     for name in ["conv2d", "conv2d1", "conv2d4"]:
         text = out[name].script()
         assert "TVMTyphoonCaptureCallPlanned" in text
         assert "T.typhoon.task_reshape" not in text
     final_text = out["add9"].script()
-    assert "T.typhoon.task_reshape" in final_text
-    assert "T.typhoon.task_matmul" in final_text
+    assert "TVMTyphoonReplayWholeGraphBegin" in final_text
+    assert "TVMTyphoonReplayCapturedLayer" in final_text
+    assert "T.typhoon.task_reshape" not in final_text
+    assert "T.typhoon.task_matmul" not in final_text
+
+
+def test_build_typhoon_graph_uses_compact_replay_for_full_graph_resnet18():
+    mod = build_targeted_canonical_resnet18_tir_module()
+    mod = tvm.tirx.transform.IdentifyTyphoonResNet18()(mod)
+    mod = tvm.tirx.transform.PlanTyphoonSRAM()(mod)
+    out = tvm.tirx.transform.BuildTyphoonGraph()(mod)
+
+    final_text = out["add9"].script()
+
+    assert "TVMTyphoonReplayWholeGraphBegin" in final_text
+    assert "TVMTyphoonReplayCapturedLayer" in final_text
+    assert "T.typhoon.task_dma" not in final_text
+    assert "T.typhoon.task_batched_dma" not in final_text

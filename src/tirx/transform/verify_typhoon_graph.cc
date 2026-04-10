@@ -105,6 +105,8 @@ class TyphoonGraphVerifier : public StmtExprVisitor {
       CollectGraphOp(call, "wait_graph");
     } else if (call->op.same_as(task_dma_op_)) {
       CollectDMATask(call);
+    } else if (call->op.same_as(task_batched_dma_op_)) {
+      CollectBatchedDMATask(call);
     } else if (call->op.same_as(task_matmul_op_)) {
       CollectTask(call, "matmul", /*num_deps_index=*/10, {2, 3}, {4});
     } else if (call->op.same_as(task_vector_op_)) {
@@ -274,6 +276,39 @@ class TyphoonGraphVerifier : public StmtExprVisitor {
     AddTask(std::move(task));
   }
 
+  void CollectBatchedDMATask(const CallNode* call) {
+    TVM_FFI_CHECK_GE(call->args.size(), 12U, ValueError)
+        << "tirx.typhoon.task_batched_dma expects dependency metadata";
+
+    TyphoonTaskInfo task;
+    RequireGraphId(call->args[0], "task_batched_dma");
+    task.task_id = ExpectInt(call->args[1], "task_id");
+    task.kind = "dma";
+    task.deps = ParseDeps(call, /*num_deps_index=*/11, task.kind);
+
+    int64_t direction = ExpectInt(call->args[2], "direction");
+    int64_t sram_region_id = ExpectInt(call->args[6], "sram_region_id");
+    task.sram_byte_offset = ExpectInt(call->args[7], "sram_byte_offset");
+    task.bytes = ExpectInt(call->args[9], "bytes");
+    TVM_FFI_CHECK_GE(task.task_id, 0, ValueError) << "Typhoon task_id must be non-negative";
+    TVM_FFI_CHECK_GE(task.sram_byte_offset, 0, ValueError)
+        << "Typhoon DMA SRAM byte offset must be non-negative";
+    TVM_FFI_CHECK_GT(task.bytes, 0, ValueError) << "Typhoon DMA bytes must be positive";
+    TVM_FFI_CHECK_GT(ExpectInt(call->args[10], "batch_count"), 0, ValueError)
+        << "Typhoon DMA batch count must be positive";
+    TVM_FFI_CHECK_GE(sram_region_id, 0, ValueError)
+        << "Typhoon DMA SRAM region id must be non-negative";
+    if (direction == 0) {
+      task.writes = {sram_region_id};
+    } else if (direction == 1) {
+      task.reads = {sram_region_id};
+    } else {
+      TVM_FFI_THROW(ValueError) << "Typhoon DMA direction must be 0 or 1";
+    }
+
+    AddTask(std::move(task));
+  }
+
   void CollectVectorTask(const CallNode* call) {
     TVM_FFI_CHECK_GT(static_cast<int>(call->args.size()), 8, ValueError)
         << "tirx.typhoon.task_vector is missing required operands";
@@ -291,7 +326,7 @@ class TyphoonGraphVerifier : public StmtExprVisitor {
     task.metadata = std::move(parsed.metadata);
     task.deps = std::move(parsed.deps);
     task.reads = {ExpectInt(call->args[3], "region_id")};
-    if (task.op_code == 0) {
+    if (task.op_code == 0 || task.op_code == 4) {
       task.reads.push_back(ExpectInt(call->args[4], "region_id"));
     }
     task.writes = {ExpectInt(call->args[5], "region_id")};
@@ -631,6 +666,43 @@ class TyphoonGraphVerifier : public StmtExprVisitor {
                 << "Typhoon vector task " << task.task_id << " has out-of-bounds size mismatch";
             break;
           }
+          case 4: {
+            TVM_FFI_CHECK_EQ(task.reads.size(), 2U, ValueError)
+                << "Typhoon vector channel_bias_add task " << task.task_id
+                << " expects exactly 2 read regions";
+            TVM_FFI_CHECK_EQ(task.writes.size(), 1U, ValueError)
+                << "Typhoon vector channel_bias_add task " << task.task_id
+                << " expects exactly 1 write region";
+            TVM_FFI_CHECK(regions_.count(task.reads[0]), ValueError)
+                << "Typhoon vector channel_bias_add task " << task.task_id
+                << " reads undeclared region " << task.reads[0];
+            TVM_FFI_CHECK(regions_.count(task.reads[1]), ValueError)
+                << "Typhoon vector channel_bias_add task " << task.task_id
+                << " reads undeclared region " << task.reads[1];
+            TVM_FFI_CHECK(regions_.count(task.writes[0]), ValueError)
+                << "Typhoon vector channel_bias_add task " << task.task_id
+                << " writes undeclared region " << task.writes[0];
+            TVM_FFI_CHECK_EQ(task.metadata.size(), 2U, ValueError)
+                << "Typhoon vector channel_bias_add task " << task.task_id
+                << " expects [channels, plane_elems] metadata";
+            TVM_FFI_CHECK_EQ(task.dtype_code, 2, ValueError)
+                << "Typhoon vector channel_bias_add task " << task.task_id
+                << " currently requires dtype_code=2";
+            int64_t channels = task.metadata[0];
+            int64_t plane_elems = task.metadata[1];
+            expect_positive(channels, "channels", task);
+            expect_positive(plane_elems, "plane_elems", task);
+            TVM_FFI_CHECK_EQ(task.elem_count, channels * plane_elems, ValueError)
+                << "Typhoon vector channel_bias_add task " << task.task_id
+                << " has elem_count mismatch";
+            TVM_FFI_CHECK_LE(task.elem_count * 4, regions_.at(task.reads[0]).size, ValueError)
+                << "Typhoon vector task " << task.task_id << " has out-of-bounds size mismatch";
+            TVM_FFI_CHECK_LE(channels * 4, regions_.at(task.reads[1]).size, ValueError)
+                << "Typhoon vector task " << task.task_id << " has out-of-bounds size mismatch";
+            TVM_FFI_CHECK_LE(task.elem_count * 4, regions_.at(task.writes[0]).size, ValueError)
+                << "Typhoon vector task " << task.task_id << " has out-of-bounds size mismatch";
+            break;
+          }
           default:
             TVM_FFI_THROW(ValueError)
                 << "Typhoon vector task " << task.task_id << " uses unsupported op_code "
@@ -745,6 +817,7 @@ class TyphoonGraphVerifier : public StmtExprVisitor {
   const Op& region_decl_op_ = Op::Get("tirx.typhoon.region_decl");
   const Op& submit_graph_op_ = Op::Get("tirx.typhoon.submit_graph");
   const Op& task_dma_op_ = Op::Get("tirx.typhoon.task_dma");
+  const Op& task_batched_dma_op_ = Op::Get("tirx.typhoon.task_batched_dma");
   const Op& task_matmul_op_ = Op::Get("tirx.typhoon.task_matmul");
   const Op& task_vector_op_ = Op::Get("tirx.typhoon.task_vector");
   const Op& task_reshape_op_ = Op::Get("tirx.typhoon.task_reshape");

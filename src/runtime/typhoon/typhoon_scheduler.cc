@@ -163,6 +163,7 @@ std::vector<TyphoonTraceRecord> TyphoonScheduler::Run(const TyphoonGraphBuilder&
       }
       running.push({finish_time, task_index_value});
       trace.push_back({task.task_id,
+                       task.layer_id,
                        KindName(task.kind),
                        ResourceName(task.kind),
                        now,
@@ -220,6 +221,7 @@ std::string SerializeTraceToJSON(const std::vector<TyphoonTraceRecord>& trace) {
     }
     os << "{"
        << "\"task_id\":" << record.task_id << ","
+       << "\"layer_id\":" << record.layer_id << ","
        << "\"kind\":\"" << record.kind << "\","
        << "\"resource\":\"" << record.resource << "\","
        << "\"start_time\":" << record.start_time << ","

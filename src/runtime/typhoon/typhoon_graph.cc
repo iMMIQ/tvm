@@ -60,6 +60,8 @@ TyphoonGraphBuilder::TyphoonGraphBuilder(int32_t graph_id) : graph_id_(graph_id)
 
 void TyphoonGraphBuilder::GraphBegin() { began_ = true; }
 
+void TyphoonGraphBuilder::SetCurrentLayerId(int32_t layer_id) { current_layer_id_ = layer_id; }
+
 void TyphoonGraphBuilder::DeclareRegion(int32_t region_id, int64_t offset, int64_t size,
                                         int64_t alignment, bool preinitialized, const char* tag) {
   if (submitted_) {
@@ -239,6 +241,7 @@ void TyphoonGraphBuilder::AddTask(TyphoonTask task) {
   if (task_index_.count(task.task_id)) {
     TyphoonError("Typhoon runtime duplicate task_id " + std::to_string(task.task_id));
   }
+  task.layer_id = current_layer_id_;
   task_index_[task.task_id] = tasks_.size();
   tasks_.push_back(std::move(task));
 }

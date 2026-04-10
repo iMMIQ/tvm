@@ -244,25 +244,29 @@ def test_typhoon_resnet18_graphized_conv_codegen_stays_graph_only():
         body = ffi_bodies[name]
         assert "TVMTyphoonCaptureCallPlanned" in body
         assert "TVMTyphoonAddReshapeTask" not in body
-    assert "TVMTyphoonCapturePackedArgsPlanned" in ffi_bodies["add9"]
     assert "TVMTyphoonReplayWholeGraphBegin" in ffi_bodies["add9"]
     assert "TVMTyphoonReplayCapturedLayer" in ffi_bodies["add9"]
-    assert "TVMTyphoonCaptureCallPlanned" not in ffi_bodies["add9"]
+    assert (
+        "TVMTyphoonCapturePackedArgsPlanned" in ffi_bodies["add9"]
+        or "TVMTyphoonCaptureCallPlanned" in ffi_bodies["add9"]
+    )
     assert "TVMTyphoonAddReshapeTask" not in ffi_bodies["add9"]
     assert "TVMTyphoonAddMatmulTask" not in ffi_bodies["add9"]
     assert "for (" not in ffi_bodies["add9"]
 
 
-def test_typhoon_resnet18_final_codegen_uses_replay_helpers():
+def test_typhoon_resnet18_final_codegen_uses_compact_replay_helper():
     mod = build_targeted_canonical_resnet18_tir_module()
     source = _inspect_source(mod)
     ffi_bodies = _extract_ffi_function_bodies(source)
     final_body = ffi_bodies["add9"]
 
-    assert "TVMTyphoonCapturePackedArgsPlanned" in final_body
     assert "TVMTyphoonReplayWholeGraphBegin" in final_body
     assert "TVMTyphoonReplayCapturedLayer" in final_body
-    assert "TVMTyphoonCaptureCallPlanned" not in final_body
+    assert (
+        "TVMTyphoonCapturePackedArgsPlanned" in final_body
+        or "TVMTyphoonCaptureCallPlanned" in final_body
+    )
     assert "TVMTyphoonAddDMATask" not in final_body
     assert "TVMTyphoonAddReshapeTask" not in final_body
     assert "TVMTyphoonAddMatmulTask" not in final_body

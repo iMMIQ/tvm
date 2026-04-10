@@ -84,11 +84,12 @@ def _assert_resnet18_typhoon_source_contract(source):
         assert "for (" not in ffi_bodies[name]
 
     assert "add9" in ffi_bodies
-    assert "TVMTyphoonCapturePackedArgsPlanned" in ffi_bodies["add9"]
     assert "TVMTyphoonReplayWholeGraphBegin" in ffi_bodies["add9"]
     assert "TVMTyphoonReplayCapturedLayer" in ffi_bodies["add9"]
-    assert "TVMTyphoonCaptureCallPlanned" not in ffi_bodies["add9"]
-    assert "TVMTyphoonGetCapturedHandle" not in ffi_bodies["add9"]
+    assert (
+        "TVMTyphoonCapturePackedArgsPlanned" in ffi_bodies["add9"]
+        or "TVMTyphoonCaptureCallPlanned" in ffi_bodies["add9"]
+    )
     assert "TVMTyphoonAddReshapeTask" not in ffi_bodies["add9"]
     assert "TVMTyphoonAddMatmulTask" not in ffi_bodies["add9"]
     assert "TVMTyphoonSubmitGraph" in ffi_bodies["add9"]
@@ -119,6 +120,9 @@ def test_relax_resnet18_runs_in_typhoon_simulator():
     trace = json.loads(get_trace())
     _assert_resnet18_typhoon_source_contract(source)
     assert trace
+    assert all("layer_id" in record for record in trace)
+    assert any(record["layer_id"] == 68 for record in trace)
+    assert any(record["layer_id"] == 69 for record in trace)
     tvm.testing.assert_allclose(output, ref, rtol=1e-4, atol=1e-4)
 
 

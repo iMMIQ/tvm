@@ -248,6 +248,7 @@ def test_typhoon_trace_has_required_fields():
     assert trace
     assert {
         "task_id",
+        "layer_id",
         "kind",
         "resource",
         "start_time",

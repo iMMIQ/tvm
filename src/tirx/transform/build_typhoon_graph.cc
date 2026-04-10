@@ -22,6 +22,7 @@
  * \brief Emit Typhoon graph IR from fixed ResNet18 and SRAM plans.
  */
 #include <tvm/ffi/function.h>
+#include <tvm/ffi/extra/structural_equal.h>
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/ffi/string.h>
 #include <tvm/target/target.h>
@@ -33,8 +34,11 @@
 #include <tvm/tirx/stmt.h>
 #include <tvm/tirx/transform.h>
 
+#include <cstdlib>
+#include <iostream>
 #include <optional>
 #include <regex>
+#include <sstream>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -45,6 +49,19 @@ namespace tvm {
 namespace tirx {
 
 namespace {
+
+bool DisablePlannedInternalizationForTesting() {
+  const char* value = std::getenv("TVM_TIRX_DISABLE_INTERNALIZATION");
+  return value != nullptr && value[0] != '\0' && value[0] != '0';
+}
+
+std::optional<int64_t> DisablePlannedInternalizationUpToLayerForTesting() {
+  const char* value = std::getenv("TVM_TIRX_DISABLE_INTERNALIZATION_UP_TO");
+  if (value == nullptr || value[0] == '\0') {
+    return std::nullopt;
+  }
+  return std::stoll(value);
+}
 
 struct RegionSpec {
   int64_t region_id;
@@ -82,6 +99,15 @@ struct PlannedLayer {
   std::vector<int64_t> weight_shape;
   std::vector<int64_t> secondary_input_shape;
   bool requires_im2col{false};
+};
+
+struct LayerOperandBinding {
+  int64_t layer_id{0};
+  int64_t input_storage_id{-1};
+  int64_t output_storage_id{-1};
+  int64_t weight_storage_id{-1};
+  int64_t secondary_input_storage_id{-1};
+  std::vector<int64_t> workspace_storage_ids;
 };
 
 const std::vector<RegionSpec>& GetCanonicalRegions() {
@@ -264,6 +290,54 @@ std::vector<RegionSpec> ExtractRegions(const std::string& json) {
   return regions;
 }
 
+std::vector<RegionSpec> ExtractPlacementRegions(const std::string& json) {
+  if (json.find("\"placement_regions\"") == std::string::npos) {
+    return ExtractRegions(json);
+  }
+  std::vector<RegionSpec> regions;
+  for (const std::string& object : SplitTopLevelObjects(ExtractJSONArrayText(json, "placement_regions"))) {
+    regions.push_back(RegionSpec{ExtractInt(object, "region_id"), ExtractString(object, "name"),
+                                 ExtractInt(object, "offset"), ExtractInt(object, "size"),
+                                 ExtractInt(object, "alignment")});
+  }
+  TVM_FFI_CHECK(!regions.empty(), ValueError)
+      << "BuildTyphoonGraph could not find any placement_regions";
+  return regions;
+}
+
+std::unordered_map<int64_t, int64_t> ExtractPlacementRegionByStorage(const std::string& json) {
+  std::unordered_map<int64_t, int64_t> placements;
+  if (json.find("\"placements\"") == std::string::npos) {
+    return placements;
+  }
+  for (const std::string& object : SplitTopLevelObjects(ExtractJSONArrayText(json, "placements"))) {
+    placements.emplace(ExtractInt(object, "storage_id"), ExtractInt(object, "region_id"));
+  }
+  return placements;
+}
+
+std::unordered_map<int64_t, LayerOperandBinding> ExtractLayerOperandBindings(const std::string& json) {
+  std::unordered_map<int64_t, LayerOperandBinding> bindings;
+  if (json.find("\"layer_operands\"") == std::string::npos) {
+    return bindings;
+  }
+  for (const std::string& object : SplitTopLevelObjects(ExtractJSONArrayText(json, "layer_operands"))) {
+    LayerOperandBinding binding;
+    binding.layer_id = ExtractInt(object, "layer_id");
+    binding.input_storage_id = ExtractInt(object, "input_storage_id");
+    binding.output_storage_id = ExtractInt(object, "output_storage_id");
+    if (object.find("\"weight_storage_id\"") != std::string::npos) {
+      binding.weight_storage_id = ExtractInt(object, "weight_storage_id");
+    }
+    if (object.find("\"secondary_input_storage_id\"") != std::string::npos) {
+      binding.secondary_input_storage_id = ExtractInt(object, "secondary_input_storage_id");
+    }
+    TryExtractArray(object, "workspace_storage_ids", &binding.workspace_storage_ids);
+    bindings.emplace(binding.layer_id, std::move(binding));
+  }
+  return bindings;
+}
+
 const RegionSpec& FindRegion(const std::vector<RegionSpec>& regions, const char* name) {
   for (const RegionSpec& region : regions) {
     if (region.name == name) {
@@ -325,6 +399,29 @@ Stmt DMATaskStmt(int64_t graph_id, int64_t task_id, int64_t direction, PrimExpr 
     args.push_back(Int32Const(dep));
   }
   return Evaluate(Call(DataType::Int(32), Op::Get("tirx.typhoon.task_dma"), args));
+}
+
+Stmt BatchedDMATaskStmt(int64_t graph_id, int64_t task_id, int64_t direction,
+                        PrimExpr global_handle, int64_t global_byte_offset,
+                        int64_t global_stride, int64_t sram_region_id,
+                        int64_t sram_byte_offset, int64_t sram_stride, int64_t bytes,
+                        int64_t batch_count, const std::vector<int64_t>& deps) {
+  ffi::Array<PrimExpr> args{Int32Const(graph_id),
+                            Int32Const(task_id),
+                            Int32Const(direction),
+                            global_handle,
+                            Int64Const(global_byte_offset),
+                            Int64Const(global_stride),
+                            Int32Const(sram_region_id),
+                            Int64Const(sram_byte_offset),
+                            Int64Const(sram_stride),
+                            Int64Const(bytes),
+                            Int64Const(batch_count),
+                            Int32Const(deps.size())};
+  for (int64_t dep : deps) {
+    args.push_back(Int32Const(dep));
+  }
+  return Evaluate(Call(DataType::Int(32), Op::Get("tirx.typhoon.task_batched_dma"), args));
 }
 
 Stmt MatmulTaskStmt(int64_t graph_id, int64_t task_id, int64_t a_region_id, int64_t b_region_id,
@@ -408,6 +505,17 @@ struct LayerSegmentTemplate {
   StandaloneGraphSegment segment;
   std::unordered_map<const VarNode*, int> buffer_data_slot;
 };
+
+struct LayerBufferSlots {
+  int input_slot{-1};
+  int output_slot{-1};
+  int secondary_input_slot{-1};
+  int weight_slot{-1};
+};
+
+bool StartsWith(const std::string& value, const char* prefix) {
+  return value.rfind(prefix, 0) == 0;
+}
 
 bool IsEvaluateCallOp(const Stmt& stmt, const Op& op, const CallNode** out_call = nullptr) {
   const auto* eval = stmt.as<EvaluateNode>();
@@ -655,8 +763,9 @@ LayerSegmentTemplate MakeLayerSegmentTemplate(PrimFunc func) {
 }
 
 Stmt RewritePlannedTaskStmt(const Stmt& stmt, int64_t graph_id, int64_t layer_id,
-                           const LayerSegmentTemplate& templ, int64_t task_id_offset,
-                           const std::vector<int64_t>& prev_segment_deps) {
+                            const LayerSegmentTemplate& templ, int64_t task_id_offset,
+                            const std::vector<int64_t>& rewritten_deps,
+                            const std::unordered_map<int64_t, int64_t>& region_remap) {
   const auto* eval = stmt.as<EvaluateNode>();
   TVM_FFI_CHECK(eval != nullptr, ValueError)
       << "BuildTyphoonGraph expected Evaluate Typhoon task statement";
@@ -664,19 +773,30 @@ Stmt RewritePlannedTaskStmt(const Stmt& stmt, int64_t graph_id, int64_t layer_id
   TVM_FFI_CHECK(call != nullptr, ValueError) << "BuildTyphoonGraph expected Typhoon task call";
 
   int64_t dep_index = GetTaskDepIndex(call);
-  int64_t original_num_deps = ExpectIntImm(call->args[dep_index], "num_deps");
-  std::vector<int64_t> rewritten_deps;
-  rewritten_deps.reserve(original_num_deps + prev_segment_deps.size());
-  if (original_num_deps == 0) {
-    rewritten_deps.insert(rewritten_deps.end(), prev_segment_deps.begin(), prev_segment_deps.end());
-  }
-  for (int64_t i = 0; i < original_num_deps; ++i) {
-    rewritten_deps.push_back(
-        ExpectIntImm(call->args[dep_index + 1 + i], "dep_task_id") + task_id_offset);
-  }
 
   ffi::Array<PrimExpr> args;
   for (int64_t i = 0; i < dep_index; ++i) {
+    auto maybe_rewrite_region_arg = [&]() -> std::optional<PrimExpr> {
+      bool is_region_arg = false;
+      if (call->op.same_as(Op::Get("tirx.typhoon.task_dma"))) {
+        is_region_arg = i == 5;
+      } else if (call->op.same_as(Op::Get("tirx.typhoon.task_matmul"))) {
+        is_region_arg = i >= 2 && i <= 4;
+      } else if (call->op.same_as(Op::Get("tirx.typhoon.task_vector"))) {
+        is_region_arg = i >= 3 && i <= 5;
+      } else if (call->op.same_as(Op::Get("tirx.typhoon.task_reshape"))) {
+        is_region_arg = i >= 2 && i <= 3;
+      }
+      if (!is_region_arg) {
+        return std::nullopt;
+      }
+      int64_t original_region_id = ExpectIntImm(call->args[i], "region_id");
+      auto it = region_remap.find(original_region_id);
+      if (it == region_remap.end()) {
+        return std::nullopt;
+      }
+      return Int32Const(it->second);
+    };
     if (i == 0) {
       args.push_back(Int32Const(graph_id));
       continue;
@@ -694,6 +814,10 @@ Stmt RewritePlannedTaskStmt(const Stmt& stmt, int64_t graph_id, int64_t layer_id
         }
       }
     }
+    if (auto rewritten = maybe_rewrite_region_arg()) {
+      args.push_back(*rewritten);
+      continue;
+    }
     args.push_back(call->args[i]);
   }
   args.push_back(Int32Const(rewritten_deps.size()));
@@ -703,12 +827,456 @@ Stmt RewritePlannedTaskStmt(const Stmt& stmt, int64_t graph_id, int64_t layer_id
   return Evaluate(Call(DataType::Int(32), Downcast<Op>(call->op), args));
 }
 
+const CallNode* ExpectTaskCall(const Stmt& stmt) {
+  const auto* eval = stmt.as<EvaluateNode>();
+  TVM_FFI_CHECK(eval != nullptr, ValueError)
+      << "BuildTyphoonGraph expected Evaluate Typhoon task statement";
+  const auto* call = eval->value.as<CallNode>();
+  TVM_FFI_CHECK(call != nullptr, ValueError) << "BuildTyphoonGraph expected Typhoon task call";
+  return call;
+}
+
+LayerBufferSlots DescribeLayerBufferSlots(const PlannedLayer& layer, const LayerSegmentTemplate& templ) {
+  LayerBufferSlots slots;
+  int num_slots = static_cast<int>(templ.func->params.size());
+  if (num_slots >= 2) {
+    slots.input_slot = 0;
+    slots.output_slot = num_slots - 1;
+  }
+  if (num_slots >= 3) {
+    if (layer.kind == "conv2d" || layer.kind == "matmul") {
+      slots.weight_slot = 1;
+    } else if (layer.kind == "bias_add" || layer.kind == "add" || layer.kind == "residual_add") {
+      slots.secondary_input_slot = 1;
+    }
+  }
+  return slots;
+}
+
+void AppendUniqueDeps(std::vector<int64_t>* deps, const std::vector<int64_t>& incoming) {
+  std::unordered_set<int64_t> seen(deps->begin(), deps->end());
+  for (int64_t dep : incoming) {
+    if (seen.insert(dep).second) {
+      deps->push_back(dep);
+    }
+  }
+}
+
+bool TryGetDMABufferSlot(const CallNode* call, const LayerSegmentTemplate& templ, int* slot) {
+  if (!call->op.same_as(Op::Get("tirx.typhoon.task_dma"))) {
+    return false;
+  }
+  if (const auto* var = call->args[3].as<VarNode>()) {
+    auto it = templ.buffer_data_slot.find(var);
+    if (it != templ.buffer_data_slot.end()) {
+      *slot = it->second;
+      return true;
+    }
+  }
+  return false;
+}
+
+bool IsStorageProducedByAnotherLayer(const std::unordered_map<int64_t, int64_t>& output_storage_owner,
+                                     int64_t storage_id, int64_t layer_id) {
+  auto it = output_storage_owner.find(storage_id);
+  return it != output_storage_owner.end() && it->second != layer_id;
+}
+
+int CountDMATasksForSlot(const LayerSegmentTemplate& templ, int slot, int64_t direction) {
+  if (slot < 0) {
+    return 0;
+  }
+  int count = 0;
+  for (const Stmt& stmt : templ.segment.task_stmts) {
+    const CallNode* call = ExpectTaskCall(stmt);
+    int dma_slot = -1;
+    if (!TryGetDMABufferSlot(call, templ, &dma_slot) || dma_slot != slot) {
+      continue;
+    }
+    if (ExpectIntImm(call->args[2], "direction") == direction) {
+      ++count;
+    }
+  }
+  return count;
+}
+
+bool CanInternalizeStorageUse(const std::unordered_map<int64_t, int64_t>& output_storage_owner,
+                              const std::unordered_map<int64_t, bool>& output_internalizable_by_layer_id,
+                              int64_t storage_id, int64_t layer_id) {
+  auto it = output_storage_owner.find(storage_id);
+  if (it == output_storage_owner.end() || it->second == layer_id) {
+    return false;
+  }
+  auto producer_it = output_internalizable_by_layer_id.find(it->second);
+  return producer_it != output_internalizable_by_layer_id.end() && producer_it->second;
+}
+
+bool CanInternalizeLayerOutput(const LayerSegmentTemplate& templ, const LayerBufferSlots& slots) {
+  // Whole-graph emission appends one complete layer segment after another.
+  // If a producer materializes its output through multiple DMA tasks, the
+  // compute tasks are reusing the same output SRAM region as a streaming tile
+  // buffer, not leaving the full tensor resident for the next layer. Skipping
+  // those output DMAs therefore drops all but the final tile.
+  return CountDMATasksForSlot(templ, slots.output_slot, 1) == 1;
+}
+
+bool ShouldSkipPlannedTask(const PlannedLayer& layer, const LayerSegmentTemplate& templ,
+                           const LayerBufferSlots& slots, const LayerOperandBinding* binding,
+                           const std::unordered_map<int64_t, int64_t>& output_storage_owner,
+                           const std::unordered_map<int64_t, bool>& output_internalizable_by_layer_id,
+                           const std::unordered_map<int64_t, int64_t>& output_internalized_consumer_counts,
+                           const std::unordered_map<int64_t, int64_t>& output_buffer_consumer_counts,
+                           const Stmt& stmt);
+
+struct RewrittenDMATaskInfo {
+  int64_t original_task_id{0};
+  int64_t direction{0};
+  PrimExpr global_handle;
+  int64_t global_byte_offset{0};
+  int64_t sram_region_id{0};
+  int64_t sram_byte_offset{0};
+  int64_t bytes{0};
+  std::vector<int64_t> original_deps;
+};
+
+PrimExpr RewritePlannedDMAGlobalHandle(int64_t graph_id, int64_t layer_id,
+                                       const LayerSegmentTemplate& templ, const CallNode* call) {
+  TVM_FFI_CHECK(call->op.same_as(Op::Get("tirx.typhoon.task_dma")), ValueError)
+      << "BuildTyphoonGraph expected DMA task";
+  if (const auto* var = call->args[3].as<VarNode>()) {
+    auto it = templ.buffer_data_slot.find(var);
+    if (it != templ.buffer_data_slot.end()) {
+      return CapturedHandleExpr(graph_id, layer_id, it->second);
+    }
+  }
+  return call->args[3];
+}
+
+RewrittenDMATaskInfo RewritePlannedDMATaskInfo(int64_t graph_id, int64_t layer_id,
+                                               const LayerSegmentTemplate& templ,
+                                               int64_t task_id_offset,
+                                               const std::unordered_map<int64_t, int64_t>& region_remap,
+                                               const CallNode* call) {
+  TVM_FFI_CHECK(call->op.same_as(Op::Get("tirx.typhoon.task_dma")), ValueError)
+      << "BuildTyphoonGraph expected DMA task";
+  RewrittenDMATaskInfo info;
+  info.original_task_id = ExpectIntImm(call->args[1], "task_id");
+  info.direction = ExpectIntImm(call->args[2], "direction");
+  info.global_handle = RewritePlannedDMAGlobalHandle(graph_id, layer_id, templ, call);
+  info.global_byte_offset = ExpectIntImm(call->args[4], "global_byte_offset");
+  int64_t original_region_id = ExpectIntImm(call->args[5], "region_id");
+  auto region_it = region_remap.find(original_region_id);
+  info.sram_region_id =
+      region_it == region_remap.end() ? original_region_id : region_it->second;
+  info.sram_byte_offset = ExpectIntImm(call->args[6], "sram_byte_offset");
+  info.bytes = ExpectIntImm(call->args[7], "bytes");
+  info.original_deps = ParseTaskDeps(call);
+  return info;
+}
+
+bool IsLinearBatchableDMADeps(const std::vector<int64_t>& first_deps,
+                              const std::vector<int64_t>& candidate_deps,
+                              int64_t previous_original_task_id) {
+  if (candidate_deps == first_deps) {
+    return true;
+  }
+  return candidate_deps.size() == 1 && candidate_deps[0] == previous_original_task_id;
+}
+
+bool TryBuildBatchedDMAStmt(
+    int64_t graph_id, const PlannedLayer& layer, const LayerSegmentTemplate& templ,
+    const LayerBufferSlots& slots, const LayerOperandBinding* binding, int64_t task_id_offset,
+    const std::unordered_map<int64_t, int64_t>& output_storage_owner,
+    const std::unordered_map<int64_t, bool>& output_internalizable_by_layer_id,
+    const std::unordered_map<int64_t, int64_t>& output_internalized_consumer_counts,
+    const std::unordered_map<int64_t, int64_t>& output_buffer_consumer_counts,
+    const std::unordered_map<int64_t, int64_t>& region_remap, const ffi::Array<Stmt>& task_stmts,
+    size_t start_index, const std::vector<int64_t>& flattened_deps, size_t* end_index,
+    std::vector<int64_t>* original_task_ids, Stmt* batched_stmt) {
+  const CallNode* start_call = ExpectTaskCall(task_stmts[start_index]);
+  if (!start_call->op.same_as(Op::Get("tirx.typhoon.task_dma"))) {
+    return false;
+  }
+
+  RewrittenDMATaskInfo first =
+      RewritePlannedDMATaskInfo(graph_id, layer.layer_id, templ, task_id_offset, region_remap, start_call);
+  std::vector<RewrittenDMATaskInfo> batch{first};
+  std::vector<int64_t> batch_task_ids{first.original_task_id};
+  size_t cursor = start_index + 1;
+  ffi::StructuralEqual structural_equal;
+  while (cursor < task_stmts.size()) {
+    if (ShouldSkipPlannedTask(layer, templ, slots, binding, output_storage_owner,
+                              output_internalizable_by_layer_id,
+                              output_internalized_consumer_counts,
+                              output_buffer_consumer_counts,
+                              task_stmts[cursor])) {
+      break;
+    }
+    const CallNode* candidate_call = ExpectTaskCall(task_stmts[cursor]);
+    if (!candidate_call->op.same_as(Op::Get("tirx.typhoon.task_dma"))) {
+      break;
+    }
+    RewrittenDMATaskInfo candidate = RewritePlannedDMATaskInfo(
+        graph_id, layer.layer_id, templ, task_id_offset, region_remap, candidate_call);
+    if (candidate.direction != first.direction || candidate.sram_region_id != first.sram_region_id ||
+        candidate.bytes != first.bytes ||
+        !structural_equal(candidate.global_handle, first.global_handle) ||
+        !IsLinearBatchableDMADeps(first.original_deps, candidate.original_deps,
+                                  batch.back().original_task_id)) {
+      break;
+    }
+    int64_t batch_index = static_cast<int64_t>(batch.size());
+    int64_t expected_global_offset =
+        first.global_byte_offset + batch_index * (candidate.global_byte_offset - first.global_byte_offset);
+    int64_t expected_sram_offset =
+        first.sram_byte_offset + batch_index * (candidate.sram_byte_offset - first.sram_byte_offset);
+    if (candidate.global_byte_offset != expected_global_offset ||
+        candidate.sram_byte_offset != expected_sram_offset) {
+      break;
+    }
+    batch.push_back(candidate);
+    batch_task_ids.push_back(candidate.original_task_id);
+    ++cursor;
+  }
+
+  if (batch.size() < 2) {
+    return false;
+  }
+
+  int64_t global_stride = batch[1].global_byte_offset - batch[0].global_byte_offset;
+  int64_t sram_stride = batch[1].sram_byte_offset - batch[0].sram_byte_offset;
+  int64_t batched_task_id = batch.back().original_task_id + task_id_offset;
+  *batched_stmt = BatchedDMATaskStmt(graph_id, batched_task_id, first.direction, first.global_handle,
+                                     first.global_byte_offset, global_stride, first.sram_region_id,
+                                     first.sram_byte_offset, sram_stride, first.bytes,
+                                     batch.size(), flattened_deps);
+  *end_index = cursor;
+  *original_task_ids = std::move(batch_task_ids);
+  return true;
+}
+
+bool ShouldSkipPlannedTask(const PlannedLayer& layer, const LayerSegmentTemplate& templ,
+                           const LayerBufferSlots& slots, const LayerOperandBinding* binding,
+                           const std::unordered_map<int64_t, int64_t>& output_storage_owner,
+                           const std::unordered_map<int64_t, bool>& output_internalizable_by_layer_id,
+                           const std::unordered_map<int64_t, int64_t>& output_internalized_consumer_counts,
+                           const std::unordered_map<int64_t, int64_t>& output_buffer_consumer_counts,
+                           const Stmt& stmt) {
+  if (binding == nullptr) {
+    return false;
+  }
+  const CallNode* call = ExpectTaskCall(stmt);
+  int slot = -1;
+  if (!TryGetDMABufferSlot(call, templ, &slot)) {
+    return false;
+  }
+  int64_t direction = ExpectIntImm(call->args[2], "direction");
+  if (direction == 0) {
+    if (slot == slots.input_slot && CountDMATasksForSlot(templ, slot, direction) > 0 &&
+        CanInternalizeStorageUse(output_storage_owner, output_internalizable_by_layer_id,
+                                 binding->input_storage_id, layer.layer_id)) {
+      return true;
+    }
+    if (slot == slots.weight_slot && CountDMATasksForSlot(templ, slot, direction) > 0 &&
+        CanInternalizeStorageUse(output_storage_owner, output_internalizable_by_layer_id,
+                                 binding->weight_storage_id, layer.layer_id)) {
+      return true;
+    }
+    if (slot == slots.secondary_input_slot &&
+        CountDMATasksForSlot(templ, slot, direction) > 0 &&
+        CanInternalizeStorageUse(output_storage_owner, output_internalizable_by_layer_id,
+                                 binding->secondary_input_storage_id,
+                                 layer.layer_id)) {
+      return true;
+    }
+    return false;
+  }
+  if (direction == 1 && slot == slots.output_slot &&
+      CountDMATasksForSlot(templ, slot, direction) > 0) {
+    auto internalized_it = output_internalized_consumer_counts.find(binding->output_storage_id);
+    auto buffered_it = output_buffer_consumer_counts.find(binding->output_storage_id);
+    return internalized_it != output_internalized_consumer_counts.end() &&
+           internalized_it->second > 0 &&
+           (buffered_it == output_buffer_consumer_counts.end() || buffered_it->second == 0);
+  }
+  return false;
+}
+
+int64_t LookupPlacedRegionId(const std::unordered_map<int64_t, int64_t>& placement_region_by_storage,
+                             int64_t storage_id, const char* field) {
+  auto it = placement_region_by_storage.find(storage_id);
+  TVM_FFI_CHECK(it != placement_region_by_storage.end(), ValueError)
+      << "BuildTyphoonGraph missing placement for " << field << " storage_id=" << storage_id;
+  return it->second;
+}
+
+std::unordered_map<int64_t, int64_t> BuildLayerRegionRemap(
+    const PlannedLayer& layer, const LayerSegmentTemplate& templ, const LayerBufferSlots& slots,
+    const std::unordered_map<int64_t, LayerOperandBinding>& bindings_by_layer_id,
+    const std::unordered_map<int64_t, int64_t>& placement_region_by_storage) {
+  auto binding_it = bindings_by_layer_id.find(layer.layer_id);
+  if (binding_it == bindings_by_layer_id.end() || placement_region_by_storage.empty()) {
+    return {};
+  }
+  const LayerOperandBinding& binding = binding_it->second;
+  std::unordered_map<int64_t, int64_t> remap;
+  auto bind_region_to_storage = [&](int64_t region_id, int64_t storage_id, const char* field) {
+    if (storage_id < 0) {
+      return;
+    }
+    remap[region_id] = LookupPlacedRegionId(placement_region_by_storage, storage_id, field);
+  };
+
+  std::unordered_map<int64_t, std::string> region_name_by_id;
+  for (const Stmt& stmt : templ.segment.region_stmts) {
+    const CallNode* call = nullptr;
+    static const Op& region_decl_op = Op::Get("tirx.typhoon.region_decl");
+    if (!IsEvaluateCallOp(stmt, region_decl_op, &call)) {
+      continue;
+    }
+    int64_t region_id = ExpectIntImm(call->args[1], "region_id");
+    const auto* name = call->args[6].as<StringImmNode>();
+    TVM_FFI_CHECK(name != nullptr, ValueError)
+        << "BuildTyphoonGraph expected region name string literal";
+    region_name_by_id[region_id] = name->value;
+  }
+
+  for (const Stmt& stmt : templ.segment.task_stmts) {
+    const CallNode* call = ExpectTaskCall(stmt);
+    int slot = -1;
+    if (!TryGetDMABufferSlot(call, templ, &slot)) {
+      continue;
+    }
+    int64_t direction = ExpectIntImm(call->args[2], "direction");
+    int64_t region_id = ExpectIntImm(call->args[5], "region_id");
+    if (direction == 0) {
+      if (slot == slots.input_slot) {
+        bind_region_to_storage(region_id, binding.input_storage_id, "input");
+      } else if (slot == slots.weight_slot) {
+        bind_region_to_storage(region_id, binding.weight_storage_id, "weight");
+      } else if (slot == slots.secondary_input_slot) {
+        bind_region_to_storage(region_id, binding.secondary_input_storage_id, "secondary_input");
+      }
+    } else if (direction == 1 && slot == slots.output_slot) {
+      bind_region_to_storage(region_id, binding.output_storage_id, "output");
+    }
+  }
+
+  for (const auto& [region_id, name] : region_name_by_id) {
+    if (remap.count(region_id) != 0) {
+      continue;
+    }
+    if (StartsWith(name, "act0")) {
+      bind_region_to_storage(region_id, binding.input_storage_id, "input");
+    } else if (StartsWith(name, "act1")) {
+      bind_region_to_storage(region_id, binding.output_storage_id, "output");
+    } else if (StartsWith(name, "residual")) {
+      if (binding.secondary_input_storage_id >= 0) {
+        bind_region_to_storage(region_id, binding.secondary_input_storage_id, "secondary_input");
+      } else {
+        bind_region_to_storage(region_id, binding.output_storage_id, "output");
+      }
+    } else if (StartsWith(name, "wgt")) {
+      bind_region_to_storage(region_id, binding.weight_storage_id, "weight");
+    }
+  }
+
+  if (!binding.workspace_storage_ids.empty()) {
+    for (const auto& [region_id, name] : region_name_by_id) {
+      if (remap.count(region_id) != 0) {
+        continue;
+      }
+      if (StartsWith(name, "col")) {
+        bind_region_to_storage(region_id, binding.workspace_storage_ids[0], "workspace0");
+      } else if (binding.workspace_storage_ids.size() > 1 && StartsWith(name, "aux")) {
+        bind_region_to_storage(region_id, binding.workspace_storage_ids[1], "workspace1");
+      }
+    }
+  }
+
+  size_t workspace_index = 0;
+  for (const auto& [region_id, name] : region_name_by_id) {
+    if (remap.count(region_id) != 0) {
+      continue;
+    }
+    if (workspace_index >= binding.workspace_storage_ids.size()) {
+      break;
+    }
+    bind_region_to_storage(region_id, binding.workspace_storage_ids[workspace_index],
+                           workspace_index == 0 ? "workspace0" : "workspace1");
+    ++workspace_index;
+  }
+  return remap;
+}
+
 ffi::Array<Stmt> BuildPlannedWholeGraphStmts(
     int64_t graph_id, const std::vector<PlannedLayer>& layers,
-    const std::unordered_map<std::string, LayerSegmentTemplate>& templates) {
+    const std::unordered_map<std::string, LayerSegmentTemplate>& templates,
+    const std::vector<RegionSpec>& placement_regions,
+    const std::unordered_map<int64_t, LayerOperandBinding>& bindings_by_layer_id,
+    const std::unordered_map<int64_t, int64_t>& placement_region_by_storage) {
   ffi::Array<Stmt> stmts;
-  for (const RegionSpec& region : GetCanonicalRegions()) {
+  const std::vector<RegionSpec>& regions = placement_regions.empty() ? GetCanonicalRegions() : placement_regions;
+  for (const RegionSpec& region : regions) {
     stmts.push_back(RegionDeclStmt(graph_id, region));
+  }
+
+  std::unordered_map<int64_t, int64_t> output_storage_owner;
+  std::unordered_map<int64_t, PlannedLayer> layers_by_id;
+  std::unordered_map<int64_t, bool> output_internalizable_by_layer_id;
+  std::unordered_map<int64_t, LayerSegmentTemplate> templates_by_layer_id;
+  std::unordered_map<int64_t, LayerBufferSlots> slots_by_layer_id;
+  for (const PlannedLayer& layer : layers) {
+    layers_by_id.emplace(layer.layer_id, layer);
+    auto templ_it = templates.find(layer.symbol);
+    TVM_FFI_CHECK(templ_it != templates.end(), ValueError)
+        << "BuildTyphoonGraph missing canonical segment template for `" << layer.symbol << "`";
+    templates_by_layer_id.emplace(layer.layer_id, templ_it->second);
+    LayerBufferSlots slots = DescribeLayerBufferSlots(layer, templ_it->second);
+    slots_by_layer_id.emplace(layer.layer_id, slots);
+    output_internalizable_by_layer_id[layer.layer_id] =
+        CanInternalizeLayerOutput(templ_it->second, slots);
+  }
+  bool disable_all_internalization = DisablePlannedInternalizationForTesting();
+  std::optional<int64_t> disable_internalization_up_to_layer =
+      DisablePlannedInternalizationUpToLayerForTesting();
+  if (disable_all_internalization || disable_internalization_up_to_layer.has_value()) {
+    for (auto& [layer_id, internalizable] : output_internalizable_by_layer_id) {
+      if (disable_all_internalization ||
+          (disable_internalization_up_to_layer.has_value() &&
+           layer_id <= disable_internalization_up_to_layer.value())) {
+        internalizable = false;
+      }
+    }
+  }
+  for (const auto& [layer_id, binding] : bindings_by_layer_id) {
+    output_storage_owner[binding.output_storage_id] = layer_id;
+  }
+  std::unordered_map<int64_t, int64_t> output_internalized_consumer_counts;
+  std::unordered_map<int64_t, int64_t> output_buffer_consumer_counts;
+  for (const auto& [layer_id, binding] : bindings_by_layer_id) {
+    const LayerSegmentTemplate& templ = templates_by_layer_id.at(layer_id);
+    const LayerBufferSlots& slots = slots_by_layer_id.at(layer_id);
+    auto account_internal_consumer = [&](int slot, int64_t storage_id) {
+      if (slot < 0 || storage_id < 0) {
+        return;
+      }
+      auto owner_it = output_storage_owner.find(storage_id);
+      if (owner_it == output_storage_owner.end() || owner_it->second == layer_id) {
+        return;
+      }
+      int dma_in_count = CountDMATasksForSlot(templ, slot, 0);
+      if (dma_in_count > 0 &&
+          CanInternalizeStorageUse(output_storage_owner, output_internalizable_by_layer_id,
+                                   storage_id, layer_id)) {
+        ++output_internalized_consumer_counts[storage_id];
+      } else {
+        ++output_buffer_consumer_counts[storage_id];
+      }
+    };
+    account_internal_consumer(slots.input_slot, binding.input_storage_id);
+    account_internal_consumer(slots.weight_slot, binding.weight_storage_id);
+    account_internal_consumer(slots.secondary_input_slot, binding.secondary_input_storage_id);
   }
 
   int64_t task_id_offset = 0;
@@ -718,12 +1286,68 @@ ffi::Array<Stmt> BuildPlannedWholeGraphStmts(
     TVM_FFI_CHECK(it != templates.end(), ValueError)
         << "BuildTyphoonGraph missing canonical segment template for `" << layer.symbol << "`";
     const LayerSegmentTemplate& templ = it->second;
-    for (const Stmt& task_stmt : templ.segment.task_stmts) {
-      stmts.push_back(
-          RewritePlannedTaskStmt(task_stmt, graph_id, layer.layer_id, templ, task_id_offset,
-                                 prev_segment_deps));
+    const LayerOperandBinding* binding = nullptr;
+    auto binding_it = bindings_by_layer_id.find(layer.layer_id);
+    if (binding_it != bindings_by_layer_id.end()) {
+      binding = &binding_it->second;
     }
-    prev_segment_deps = OffsetTaskIds(templ.segment.sink_task_ids, task_id_offset);
+    LayerBufferSlots slots = DescribeLayerBufferSlots(layer, templ);
+    std::unordered_map<int64_t, int64_t> region_remap =
+        BuildLayerRegionRemap(layer, templ, slots, bindings_by_layer_id, placement_region_by_storage);
+    std::unordered_map<int64_t, std::vector<int64_t>> rewritten_task_deps_by_original_id;
+    for (size_t task_index = 0; task_index < templ.segment.task_stmts.size(); ++task_index) {
+      const Stmt& task_stmt = templ.segment.task_stmts[task_index];
+      const CallNode* call = ExpectTaskCall(task_stmt);
+      int64_t original_task_id = ExpectIntImm(call->args[1], "task_id");
+      std::vector<int64_t> flattened_deps;
+      std::vector<int64_t> original_deps = ParseTaskDeps(call);
+      if (original_deps.empty()) {
+        AppendUniqueDeps(&flattened_deps, prev_segment_deps);
+      } else {
+        for (int64_t dep : original_deps) {
+          auto dep_it = rewritten_task_deps_by_original_id.find(dep);
+          if (dep_it != rewritten_task_deps_by_original_id.end()) {
+            AppendUniqueDeps(&flattened_deps, dep_it->second);
+          }
+        }
+      }
+      if (ShouldSkipPlannedTask(layer, templ, slots, binding, output_storage_owner,
+                                output_internalizable_by_layer_id,
+                                output_internalized_consumer_counts,
+                                output_buffer_consumer_counts,
+                                task_stmt)) {
+        rewritten_task_deps_by_original_id[original_task_id] = std::move(flattened_deps);
+        continue;
+      }
+      size_t batch_end_index = task_index;
+      std::vector<int64_t> batched_original_task_ids;
+      Stmt batched_stmt;
+      if (TryBuildBatchedDMAStmt(graph_id, layer, templ, slots, binding, task_id_offset,
+                                 output_storage_owner, output_internalizable_by_layer_id,
+                                 output_internalized_consumer_counts,
+                                 output_buffer_consumer_counts, region_remap,
+                                 templ.segment.task_stmts, task_index, flattened_deps,
+                                 &batch_end_index, &batched_original_task_ids, &batched_stmt)) {
+        int64_t batched_task_id =
+            batched_original_task_ids.back() + task_id_offset;
+        stmts.push_back(std::move(batched_stmt));
+        for (int64_t batched_original_task_id : batched_original_task_ids) {
+          rewritten_task_deps_by_original_id[batched_original_task_id] = {batched_task_id};
+        }
+        task_index = batch_end_index - 1;
+        continue;
+      }
+      stmts.push_back(RewritePlannedTaskStmt(task_stmt, graph_id, layer.layer_id, templ, task_id_offset,
+                                            flattened_deps, region_remap));
+      rewritten_task_deps_by_original_id[original_task_id] = {original_task_id + task_id_offset};
+    }
+    prev_segment_deps.clear();
+    for (int64_t sink_task_id : templ.segment.sink_task_ids) {
+      auto sink_it = rewritten_task_deps_by_original_id.find(sink_task_id);
+      if (sink_it != rewritten_task_deps_by_original_id.end()) {
+        AppendUniqueDeps(&prev_segment_deps, sink_it->second);
+      }
+    }
     task_id_offset += templ.segment.task_count;
   }
   stmts.push_back(SubmitGraphStmt(graph_id));
@@ -806,6 +1430,11 @@ bool MatchesPlannedSymbol(const std::string& actual_symbol, const std::string& p
     return actual_symbol.substr(std::strlen(kPackedFFIPrefix)) == planned_symbol;
   }
   return false;
+}
+
+bool IsFullGraphRecognitionPlan(const std::string& plan) {
+  return plan.find("\"recognized_scope\":\"full_graph\"") != std::string::npos ||
+         plan.find("\"recognized_scope\": \"full_graph\"") != std::string::npos;
 }
 
 std::vector<int64_t> OffsetTaskIds(const std::vector<int64_t>& task_ids, int64_t offset) {
@@ -1054,6 +1683,9 @@ PrimFunc BuildChunkedAddBody(PrimFunc func) {
   Buffer lhs = (*it).second;
   Buffer rhs = (*std::next(it)).second;
   Buffer output = (*std::next(it, 2)).second;
+  std::vector<int64_t> lhs_shape = ExpectConstantShape(lhs, lhs->name.c_str());
+  std::vector<int64_t> rhs_shape = ExpectConstantShape(rhs, rhs->name.c_str());
+  std::vector<int64_t> out_shape = ExpectConstantShape(output, output->name.c_str());
   int64_t lhs_bytes = BufferBytes(lhs);
   int64_t rhs_bytes = BufferBytes(rhs);
   const int64_t graph_id = 0;
@@ -1062,6 +1694,9 @@ PrimFunc BuildChunkedAddBody(PrimFunc func) {
   std::vector<int64_t> carry_deps;
   AppendGraphPrelude(&stmts, graph_id, {&act0, &residual, &act1});
   bool broadcast = rhs_bytes < lhs_bytes;
+  bool channel_bias_broadcast =
+      lhs_shape.size() == 4 && rhs_shape.size() == 4 && out_shape == lhs_shape &&
+      rhs_shape[0] == 1 && rhs_shape[1] == lhs_shape[1] && rhs_shape[2] == 1 && rhs_shape[3] == 1;
   if (!broadcast) {
     for (int64_t offset = 0; offset < lhs_bytes; offset += act0.size) {
       int64_t chunk_bytes = std::min<int64_t>(act0.size, lhs_bytes - offset);
@@ -1078,6 +1713,64 @@ PrimFunc BuildChunkedAddBody(PrimFunc func) {
       stmts.push_back(DMATaskStmt(graph_id, dma_out, 1, output->data, offset, act1.region_id,
                                   chunk_bytes, {vector}));
       carry_deps = {dma_out};
+    }
+  } else if (channel_bias_broadcast) {
+    int64_t batch = lhs_shape[0];
+    int64_t channels = lhs_shape[1];
+    int64_t height = lhs_shape[2];
+    int64_t width = lhs_shape[3];
+    int64_t plane_elems = height * width;
+    int64_t plane_bytes = plane_elems * 4;
+    int64_t channel_chunk = std::max<int64_t>(1, act0.size / plane_bytes);
+    channel_chunk = std::min<int64_t>(channel_chunk, act1.size / plane_bytes);
+    channel_chunk = std::min<int64_t>(channel_chunk, residual.size / 4);
+    channel_chunk = std::min<int64_t>(channel_chunk, channels);
+    TVM_FFI_CHECK_GT(channel_chunk, 0, ValueError)
+        << "BuildTyphoonGraph could not fit channel-bias add tile in canonical SRAM region";
+    for (int64_t n = 0; n < batch; ++n) {
+      int64_t batch_base_offset = n * channels * plane_bytes;
+      for (int64_t c_offset = 0; c_offset < channels; c_offset += channel_chunk) {
+        int64_t c = std::min<int64_t>(channel_chunk, channels - c_offset);
+        int64_t plane_offset = batch_base_offset + c_offset * plane_bytes;
+        int64_t bias_offset = c_offset * 4;
+
+        int64_t last_lhs_dma = -1;
+        for (int64_t ci = 0; ci < c; ++ci) {
+          int64_t dma_lhs = next_task_id++;
+          std::vector<int64_t> deps = last_lhs_dma >= 0 ? std::vector<int64_t>{last_lhs_dma} : carry_deps;
+          stmts.push_back(
+              DMATaskStmt(graph_id, dma_lhs, 0, lhs->data, plane_offset + ci * plane_bytes,
+                          act0.region_id, plane_bytes, deps, ci * plane_bytes));
+          last_lhs_dma = dma_lhs;
+        }
+
+        int64_t last_bias_dma = -1;
+        for (int64_t ci = 0; ci < c; ++ci) {
+          int64_t dma_bias = next_task_id++;
+          std::vector<int64_t> deps =
+              last_bias_dma >= 0 ? std::vector<int64_t>{last_bias_dma} : carry_deps;
+          stmts.push_back(
+              DMATaskStmt(graph_id, dma_bias, 0, rhs->data, bias_offset + ci * 4, residual.region_id,
+                          4, deps, ci * 4));
+          last_bias_dma = dma_bias;
+        }
+
+        int64_t vector = next_task_id++;
+        stmts.push_back(VectorTaskStmt(graph_id, vector, 4, act0.region_id, residual.region_id,
+                                       act1.region_id, c * plane_elems, {c, plane_elems},
+                                       {last_lhs_dma, last_bias_dma}));
+
+        std::vector<int64_t> output_dma_ids;
+        output_dma_ids.reserve(static_cast<size_t>(c));
+        for (int64_t ci = 0; ci < c; ++ci) {
+          int64_t dma_out = next_task_id++;
+          stmts.push_back(
+              DMATaskStmt(graph_id, dma_out, 1, output->data, plane_offset + ci * plane_bytes,
+                          act1.region_id, plane_bytes, {vector}, ci * plane_bytes));
+          output_dma_ids.push_back(dma_out);
+        }
+        carry_deps = std::move(output_dma_ids);
+      }
     }
   } else {
     int64_t inner = rhs_bytes / 4;
@@ -1440,6 +2133,15 @@ Pass BuildTyphoonGraph() {
     int64_t graph_id = 0;
     bool single_function = mod->functions.size() == 1;
     std::vector<PlannedLayer> planned_layers;
+    bool full_graph_plan = IsFullGraphRecognitionPlan(resnet_plan.value());
+    std::vector<RegionSpec> placement_regions =
+        full_graph_plan ? std::vector<RegionSpec>{} : ExtractPlacementRegions(sram_plan.value());
+    std::unordered_map<int64_t, int64_t> placement_region_by_storage =
+        full_graph_plan ? std::unordered_map<int64_t, int64_t>{}
+                        : ExtractPlacementRegionByStorage(sram_plan.value());
+    std::unordered_map<int64_t, LayerOperandBinding> layer_operand_bindings =
+        full_graph_plan ? std::unordered_map<int64_t, LayerOperandBinding>{}
+                        : ExtractLayerOperandBindings(sram_plan.value());
     if (!single_function) {
       planned_layers = ParsePlannedLayers(resnet_plan.value());
     }
@@ -1473,7 +2175,7 @@ Pass BuildTyphoonGraph() {
         continue;
       }
       typhoon_funcs_by_symbol[symbol] = {gvar, prim_func};
-      if (planned_symbols.count(symbol) != 0) {
+      if (!full_graph_plan && planned_symbols.count(symbol) != 0) {
         auto rewritten = MaybeBuildCanonicalFunction(prim_func);
         TVM_FFI_CHECK(rewritten.has_value(), ValueError)
             << "BuildTyphoonGraph could not build canonical segment for `" << symbol << "`";
@@ -1485,8 +2187,10 @@ Pass BuildTyphoonGraph() {
       for (const PlannedLayer& layer : planned_layers) {
         TVM_FFI_CHECK(typhoon_funcs_by_symbol.count(layer.symbol) != 0, ValueError)
             << "BuildTyphoonGraph plan references missing symbol `" << layer.symbol << "`";
-        TVM_FFI_CHECK(layer_templates.count(layer.symbol) != 0, ValueError)
-            << "BuildTyphoonGraph plan references untemplated symbol `" << layer.symbol << "`";
+        if (!full_graph_plan) {
+          TVM_FFI_CHECK(layer_templates.count(layer.symbol) != 0, ValueError)
+              << "BuildTyphoonGraph plan references untemplated symbol `" << layer.symbol << "`";
+        }
       }
 
       for (const auto& [symbol, entry] : typhoon_funcs_by_symbol) {
@@ -1495,14 +2199,23 @@ Pass BuildTyphoonGraph() {
         }
         PrimFunc rewritten = entry.second;
         auto* n = rewritten.CopyOnWrite();
-        ffi::Array<Stmt> stmts{
-            CaptureCallStmt(graph_id, planned_layer_ids_by_symbol.at(symbol), entry.second)};
         if (symbol == final_symbol) {
-          for (const Stmt& stmt : BuildPlannedWholeGraphStmts(graph_id, planned_layers, layer_templates)) {
-            stmts.push_back(stmt);
+          if (full_graph_plan) {
+            n->body = SeqStmt(BuildReplayWholeGraphStmts(graph_id, entry.second, planned_layers));
+          } else {
+            ffi::Array<Stmt> stmts{
+                CaptureCallStmt(graph_id, planned_layer_ids_by_symbol.at(symbol), entry.second)};
+            for (const Stmt& stmt :
+                 BuildPlannedWholeGraphStmts(graph_id, planned_layers, layer_templates,
+                                             placement_regions, layer_operand_bindings,
+                                             placement_region_by_storage)) {
+              stmts.push_back(stmt);
+            }
+            n->body = SeqStmt(stmts);
           }
+        } else {
+          n->body = CaptureCallStmt(graph_id, planned_layer_ids_by_symbol.at(symbol), entry.second);
         }
-        n->body = stmts.size() == 1 ? stmts[0] : SeqStmt(stmts);
         write_ptr->Update(entry.first, rewritten);
       }
       return updated;
@@ -1518,8 +2231,12 @@ Pass CompactTyphoonWholeGraph() {
     if (!resnet_plan.has_value()) {
       return mod;
     }
+    std::string plan = resnet_plan.value();
+    if (IsFullGraphRecognitionPlan(plan)) {
+      return mod;
+    }
 
-    std::vector<PlannedLayer> planned_layers = ParsePlannedLayers(resnet_plan.value());
+    std::vector<PlannedLayer> planned_layers = ParsePlannedLayers(plan);
     TVM_FFI_CHECK(!planned_layers.empty(), ValueError)
         << "CompactTyphoonWholeGraph requires planned layers";
     std::string final_symbol = planned_layers.back().symbol;
