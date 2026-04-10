@@ -34,6 +34,7 @@
 #include <tvm/tirx/stmt.h>
 #include <tvm/tirx/transform.h>
 
+#include <cmath>
 #include <cstdlib>
 #include <iostream>
 #include <optional>
@@ -99,6 +100,15 @@ struct PlannedLayer {
   std::vector<int64_t> weight_shape;
   std::vector<int64_t> secondary_input_shape;
   bool requires_im2col{false};
+};
+
+struct SemanticNodePlan {
+  int64_t graph_id{0};
+  int64_t node_id{0};
+  std::string symbol;
+  std::string op_family;
+  std::vector<std::string> input_roles;
+  std::vector<int64_t> output_shape;
 };
 
 struct LayerOperandBinding {
@@ -267,6 +277,54 @@ std::vector<PlannedLayer> ParsePlannedLayers(const std::string& plan_json) {
   }
   TVM_FFI_CHECK(!layers.empty(), ValueError) << "BuildTyphoonGraph requires planned layers";
   return layers;
+}
+
+std::vector<std::string> ParseStringArray(const std::string& text) {
+  std::vector<std::string> values;
+  std::regex pattern("\"([^\"]+)\"");
+  for (auto it = std::sregex_iterator(text.begin(), text.end(), pattern);
+       it != std::sregex_iterator(); ++it) {
+    values.push_back((*it)[1].str());
+  }
+  return values;
+}
+
+std::vector<std::string> ExtractStringArray(const std::string& json, const char* key) {
+  std::regex pattern(std::string("\"") + key + "\"\\s*:\\s*\\[([^\\]]*)\\]");
+  std::smatch match;
+  TVM_FFI_CHECK(std::regex_search(json, match, pattern), ValueError)
+      << "BuildTyphoonGraph could not find `" << key << "`";
+  return ParseStringArray(match[1].str());
+}
+
+bool TryExtractArrayObjectField(const std::string& json, const char* key, std::vector<int64_t>* value) {
+  std::regex pattern(std::string("\"") + key + "\"\\s*:\\s*\\[([^\\]]*)\\]");
+  std::smatch match;
+  if (!std::regex_search(json, match, pattern)) {
+    return false;
+  }
+  *value = ParseIntList(match[1].str());
+  return true;
+}
+
+std::vector<SemanticNodePlan> ParseSemanticNodePlans(const std::string& plan_json) {
+  std::vector<SemanticNodePlan> nodes;
+  for (const std::string& graph_object :
+       SplitTopLevelObjects(ExtractJSONArrayText(plan_json, "graphs"))) {
+    int64_t graph_id = ExtractInt(graph_object, "graph_id");
+    std::string nodes_text = ExtractJSONArrayText(graph_object, "nodes");
+    for (const std::string& node_object : SplitTopLevelObjects(nodes_text)) {
+      SemanticNodePlan node;
+      node.graph_id = graph_id;
+      node.node_id = ExtractInt(node_object, "node_id");
+      node.symbol = ExtractString(node_object, "symbol");
+      node.op_family = ExtractString(node_object, "op_family");
+      node.input_roles = ExtractStringArray(node_object, "input_roles");
+      TryExtractArrayObjectField(node_object, "output_shape", &node.output_shape);
+      nodes.push_back(std::move(node));
+    }
+  }
+  return nodes;
 }
 
 std::vector<RegionSpec> ExtractRegions(const std::string& json) {
@@ -1838,9 +1896,70 @@ PrimFunc BuildChunkedCopyBody(PrimFunc func) {
 }
 
 PrimFunc BuildTransposeCopyBody(PrimFunc func) {
-  // The downstream dense path consumes the RHS as [N, K] with layout_code=1, so
-  // the canonical fc.weight buffer can be forwarded without a materialized transpose.
-  return BuildChunkedCopyBody(std::move(func));
+  const auto& regions = GetCanonicalRegions();
+  const RegionSpec& act0 = FindRegion(regions, "act0");
+  const RegionSpec& act1 = FindRegion(regions, "act1");
+  auto it = func->buffer_map.begin();
+  Buffer input = (*it).second;
+  Buffer output = (*std::next(it)).second;
+  std::vector<int64_t> input_shape = ExpectConstantShape(input, input->name.c_str());
+  std::vector<int64_t> output_shape = ExpectConstantShape(output, output->name.c_str());
+  TVM_FFI_CHECK_EQ(input_shape.size(), 2U, ValueError)
+      << "BuildTyphoonGraph transpose lowering expects rank-2 input";
+  TVM_FFI_CHECK_EQ(output_shape.size(), 2U, ValueError)
+      << "BuildTyphoonGraph transpose lowering expects rank-2 output";
+
+  int64_t rows = input_shape[0];
+  int64_t cols = input_shape[1];
+  TVM_FFI_CHECK_EQ(output_shape[0], cols, ValueError)
+      << "BuildTyphoonGraph transpose output shape mismatch";
+  TVM_FFI_CHECK_EQ(output_shape[1], rows, ValueError)
+      << "BuildTyphoonGraph transpose output shape mismatch";
+
+  int64_t tile_elem_capacity = std::min<int64_t>(act0.size, act1.size) / 4;
+  TVM_FFI_CHECK_GT(tile_elem_capacity, 0, ValueError)
+      << "BuildTyphoonGraph transpose lowering could not fit any tile in canonical SRAM";
+
+  int64_t col_chunk = std::min<int64_t>(cols, std::max<int64_t>(1, static_cast<int64_t>(
+                                                          std::sqrt(tile_elem_capacity))));
+  int64_t row_chunk = std::max<int64_t>(1, tile_elem_capacity / col_chunk);
+  row_chunk = std::min<int64_t>(row_chunk, rows);
+
+  const int64_t input_row_bytes = cols * 4;
+  const int64_t output_row_bytes = rows * 4;
+  const int64_t graph_id = 0;
+  ffi::Array<Stmt> stmts;
+  int64_t next_task_id = 0;
+  std::vector<int64_t> carry_deps;
+  AppendGraphPrelude(&stmts, graph_id, {&act0, &act1});
+
+  for (int64_t row_offset = 0; row_offset < rows; row_offset += row_chunk) {
+    int64_t row_tile = std::min<int64_t>(row_chunk, rows - row_offset);
+    for (int64_t col_offset = 0; col_offset < cols; col_offset += col_chunk) {
+      int64_t col_tile = std::min<int64_t>(col_chunk, cols - col_offset);
+      int64_t tile_bytes = row_tile * col_tile * 4;
+      int64_t dma_in = next_task_id++;
+      int64_t transpose = next_task_id++;
+      int64_t dma_out = next_task_id++;
+      int64_t input_offset = (row_offset * cols + col_offset) * 4;
+      int64_t output_offset = (col_offset * rows + row_offset) * 4;
+      stmts.push_back(BatchedDMATaskStmt(graph_id, dma_in, 0, input->data, input_offset,
+                                         input_row_bytes, act0.region_id, 0, col_tile * 4,
+                                         col_tile * 4, row_tile, carry_deps));
+      stmts.push_back(ReshapeTaskStmt(graph_id, transpose, act0.region_id, act1.region_id, 2,
+                                      {row_tile, col_tile}, tile_bytes, {dma_in}));
+      stmts.push_back(BatchedDMATaskStmt(graph_id, dma_out, 1, output->data, output_offset,
+                                         output_row_bytes, act1.region_id, 0, row_tile * 4,
+                                         row_tile * 4, col_tile, {transpose}));
+      carry_deps = {dma_out};
+    }
+  }
+
+  stmts.push_back(SubmitGraphStmt(graph_id));
+  stmts.push_back(WaitGraphStmt(graph_id));
+  auto* n = func.CopyOnWrite();
+  n->body = SeqStmt(stmts);
+  return func;
 }
 
 PrimFunc BuildMaxPoolBody(PrimFunc func) {
@@ -1933,6 +2052,19 @@ PrimFunc BuildGlobalAveragePoolBody(PrimFunc func) {
   return func;
 }
 
+int64_t InferMatmulLayoutCode(const std::vector<int64_t>& weight_shape, int64_t k, int64_t n_total) {
+  TVM_FFI_CHECK_EQ(weight_shape.size(), 2U, ValueError)
+      << "BuildTyphoonGraph expects dense weight to be rank-2";
+  if (weight_shape[0] == k && weight_shape[1] == n_total) {
+    return 0;
+  }
+  if (weight_shape[0] == n_total && weight_shape[1] == k) {
+    return 1;
+  }
+  TVM_FFI_THROW(ValueError) << "BuildTyphoonGraph could not infer dense weight layout";
+  return 0;
+}
+
 PrimFunc BuildDenseMatmulBody(PrimFunc func) {
   const auto& regions = GetCanonicalRegions();
   const RegionSpec& act0 = FindRegion(regions, "act0");
@@ -1943,9 +2075,11 @@ PrimFunc BuildDenseMatmulBody(PrimFunc func) {
   Buffer weight = (*std::next(it)).second;
   Buffer output = (*std::next(it, 2)).second;
   std::vector<int64_t> input_shape = ExpectConstantShape(input, input->name.c_str());
+  std::vector<int64_t> weight_shape = ExpectConstantShape(weight, weight->name.c_str());
   std::vector<int64_t> output_shape = ExpectConstantShape(output, output->name.c_str());
   int64_t k = input_shape[1];
   int64_t n_total = output_shape[1];
+  int64_t layout_code = InferMatmulLayoutCode(weight_shape, k, n_total);
   int64_t n_chunk = std::max<int64_t>(1, wgt0.size / (k * 4));
   n_chunk = std::min<int64_t>(n_chunk, n_total);
   const int64_t graph_id = 0;
@@ -1955,7 +2089,6 @@ PrimFunc BuildDenseMatmulBody(PrimFunc func) {
   AppendGraphPrelude(&stmts, graph_id, {&act0, &wgt0, &act1});
   for (int64_t n_offset = 0; n_offset < n_total; n_offset += n_chunk) {
     int64_t n = std::min<int64_t>(n_chunk, n_total - n_offset);
-    int64_t weight_offset = n_offset * k * 4;
     int64_t weight_bytes = n * k * 4;
     int64_t output_bytes = n * 4;
     int64_t dma_input = next_task_id++;
@@ -1964,10 +2097,16 @@ PrimFunc BuildDenseMatmulBody(PrimFunc func) {
     int64_t dma_out = next_task_id++;
     stmts.push_back(
         DMATaskStmt(graph_id, dma_input, 0, input->data, 0, act0.region_id, k * 4, carry_deps));
-    stmts.push_back(DMATaskStmt(graph_id, dma_weight, 0, weight->data, weight_offset,
-                                wgt0.region_id, weight_bytes, carry_deps));
+    if (layout_code == 0) {
+      stmts.push_back(BatchedDMATaskStmt(graph_id, dma_weight, 0, weight->data, n_offset * 4,
+                                         n_total * 4, wgt0.region_id, 0, n * 4, n * 4, k,
+                                         carry_deps));
+    } else {
+      stmts.push_back(DMATaskStmt(graph_id, dma_weight, 0, weight->data, n_offset * k * 4,
+                                  wgt0.region_id, weight_bytes, carry_deps));
+    }
     stmts.push_back(MatmulTaskStmt(graph_id, matmul, act0.region_id, wgt0.region_id, act1.region_id,
-                                   {1, n, k}, 1, {dma_input, dma_weight}));
+                                   {1, n, k}, layout_code, {dma_input, dma_weight}));
     stmts.push_back(DMATaskStmt(graph_id, dma_out, 1, output->data, n_offset * 4, act1.region_id,
                                 output_bytes, {matmul}));
     carry_deps = {dma_out};
@@ -1977,6 +2116,257 @@ PrimFunc BuildDenseMatmulBody(PrimFunc func) {
   auto* n = func.CopyOnWrite();
   n->body = SeqStmt(stmts);
   return func;
+}
+
+PrimFunc BuildDenseMatmulBiasBody(PrimFunc func) {
+  const auto& regions = GetCanonicalRegions();
+  const RegionSpec& act0 = FindRegion(regions, "act0");
+  const RegionSpec& act1 = FindRegion(regions, "act1");
+  const RegionSpec& wgt0 = FindRegion(regions, "wgt0");
+  const RegionSpec& residual = FindRegion(regions, "residual");
+  auto it = func->buffer_map.begin();
+  Buffer input = (*it).second;
+  Buffer weight = (*std::next(it)).second;
+  Buffer bias = (*std::next(it, 2)).second;
+  Buffer output = (*std::next(it, 3)).second;
+  std::vector<int64_t> input_shape = ExpectConstantShape(input, input->name.c_str());
+  std::vector<int64_t> weight_shape = ExpectConstantShape(weight, weight->name.c_str());
+  std::vector<int64_t> output_shape = ExpectConstantShape(output, output->name.c_str());
+  int64_t k = input_shape[1];
+  int64_t n_total = output_shape[1];
+  int64_t layout_code = InferMatmulLayoutCode(weight_shape, k, n_total);
+  int64_t n_chunk = std::max<int64_t>(1, wgt0.size / (k * 4));
+  n_chunk = std::min<int64_t>(n_chunk, n_total);
+  n_chunk = std::min<int64_t>(n_chunk, residual.size / 4);
+  const int64_t graph_id = 0;
+  ffi::Array<Stmt> stmts;
+  int64_t next_task_id = 0;
+  std::vector<int64_t> carry_deps;
+  AppendGraphPrelude(&stmts, graph_id, {&act0, &wgt0, &residual, &act1});
+  for (int64_t n_offset = 0; n_offset < n_total; n_offset += n_chunk) {
+    int64_t n = std::min<int64_t>(n_chunk, n_total - n_offset);
+    int64_t weight_bytes = n * k * 4;
+    int64_t bias_offset = n_offset * 4;
+    int64_t output_bytes = n * 4;
+    int64_t dma_input = next_task_id++;
+    int64_t dma_weight = next_task_id++;
+    int64_t matmul = next_task_id++;
+    int64_t dma_bias = next_task_id++;
+    int64_t vector = next_task_id++;
+    int64_t dma_out = next_task_id++;
+    stmts.push_back(
+        DMATaskStmt(graph_id, dma_input, 0, input->data, 0, act0.region_id, k * 4, carry_deps));
+    if (layout_code == 0) {
+      stmts.push_back(BatchedDMATaskStmt(graph_id, dma_weight, 0, weight->data, n_offset * 4,
+                                         n_total * 4, wgt0.region_id, 0, n * 4, n * 4, k,
+                                         carry_deps));
+    } else {
+      stmts.push_back(DMATaskStmt(graph_id, dma_weight, 0, weight->data, n_offset * k * 4,
+                                  wgt0.region_id, weight_bytes, carry_deps));
+    }
+    stmts.push_back(MatmulTaskStmt(graph_id, matmul, act0.region_id, wgt0.region_id, act1.region_id,
+                                   {1, n, k}, layout_code, {dma_input, dma_weight}));
+    stmts.push_back(DMATaskStmt(graph_id, dma_bias, 0, bias->data, bias_offset, residual.region_id,
+                                output_bytes, carry_deps));
+    stmts.push_back(VectorTaskStmt(graph_id, vector, 0, act1.region_id, residual.region_id,
+                                   act0.region_id, n, {}, {matmul, dma_bias}));
+    stmts.push_back(DMATaskStmt(graph_id, dma_out, 1, output->data, n_offset * 4, act0.region_id,
+                                output_bytes, {vector}));
+    carry_deps = {dma_out};
+  }
+  stmts.push_back(SubmitGraphStmt(graph_id));
+  stmts.push_back(WaitGraphStmt(graph_id));
+  auto* n = func.CopyOnWrite();
+  n->body = SeqStmt(stmts);
+  return func;
+}
+
+PrimFunc BuildSemanticConvBody(PrimFunc func, bool has_residual, bool has_relu) {
+  const auto& regions = GetCanonicalRegions();
+  const RegionSpec& act0 = FindRegion(regions, "act0");
+  const RegionSpec& act1 = FindRegion(regions, "act1");
+  const RegionSpec& residual = FindRegion(regions, "residual");
+  const RegionSpec& wgt0 = FindRegion(regions, "wgt0");
+  const RegionSpec& col0 = FindRegion(regions, "col0");
+  const RegionSpec& aux0 = FindRegion(regions, "aux0");
+
+  auto it = func->buffer_map.begin();
+  Buffer input = (*it).second;
+  Buffer weight = (*std::next(it)).second;
+  Buffer bias = (*std::next(it, 2)).second;
+  Buffer residual_input = has_residual ? (*std::next(it, 3)).second : Buffer();
+  Buffer output = has_residual ? (*std::next(it, 4)).second : (*std::next(it, 3)).second;
+  Conv2DConfig config = MakeConv2DConfig(input, weight, output);
+
+  int64_t out_h_tile = ComputeConvOutputTileHeight(config, act0, col0);
+  int64_t max_weight_channels = wgt0.size / (config.patch_size * 4);
+  TVM_FFI_CHECK_GT(max_weight_channels, 0, ValueError)
+      << "BuildTyphoonGraph could not fit conv weights in canonical SRAM region";
+
+  const int64_t graph_id = 0;
+  ffi::Array<Stmt> stmts;
+  int64_t next_task_id = 0;
+  std::vector<int64_t> carry_deps;
+  AppendGraphPrelude(&stmts, graph_id, {&act0, &col0, &wgt0, &aux0, &residual, &act1});
+
+  for (int64_t out_h_start = 0; out_h_start < config.out_h; out_h_start += out_h_tile) {
+    int64_t current_out_h_tile = std::min<int64_t>(out_h_tile, config.out_h - out_h_start);
+    int64_t raw_input_h_start = out_h_start * config.stride_h - config.pad_h;
+    int64_t raw_input_h_end =
+        (out_h_start + current_out_h_tile - 1) * config.stride_h - config.pad_h + config.kernel_h;
+    int64_t input_h_start = std::max<int64_t>(0, raw_input_h_start);
+    int64_t input_h_end = std::min<int64_t>(config.in_h, raw_input_h_end);
+    int64_t input_h_tile = input_h_end - input_h_start;
+    TVM_FFI_CHECK_GT(input_h_tile, 0, ValueError)
+        << "BuildTyphoonGraph generated an empty conv input tile";
+
+    int64_t last_input_dma = -1;
+    for (int64_t ic = 0; ic < config.in_channels; ++ic) {
+      int64_t dma_input = next_task_id++;
+      std::vector<int64_t> deps =
+          last_input_dma >= 0 ? std::vector<int64_t>{last_input_dma} : carry_deps;
+      stmts.push_back(DMATaskStmt(graph_id, dma_input, 0, input->data,
+                                  NCHWChannelOffsetBytes(ic, input_h_start, config.in_h, config.in_w),
+                                  act0.region_id, NCHWChannelPlaneBytes(input_h_tile, config.in_w), deps,
+                                  ic * NCHWChannelPlaneBytes(input_h_tile, config.in_w)));
+      last_input_dma = dma_input;
+    }
+
+    int64_t rows = current_out_h_tile * config.out_w;
+    int64_t plane_elems = rows;
+    int64_t plane_bytes = plane_elems * 4;
+    int64_t max_output_channels = aux0.size / plane_bytes;
+    int64_t out_channel_chunk =
+        std::min<int64_t>(config.out_channels, std::min(max_weight_channels, max_output_channels));
+    out_channel_chunk = std::min<int64_t>(out_channel_chunk, act0.size / plane_bytes);
+    out_channel_chunk = std::min<int64_t>(out_channel_chunk, act1.size / plane_bytes);
+    if (has_residual) {
+      out_channel_chunk = std::min<int64_t>(out_channel_chunk, residual.size / plane_bytes);
+      out_channel_chunk = std::min<int64_t>(out_channel_chunk, aux0.size / 4);
+    } else {
+      out_channel_chunk = std::min<int64_t>(out_channel_chunk, residual.size / 4);
+    }
+    TVM_FFI_CHECK_GT(out_channel_chunk, 0, ValueError)
+        << "BuildTyphoonGraph could not fit fused conv tile in canonical SRAM region";
+
+    int64_t reshape = next_task_id++;
+    stmts.push_back(ReshapeTaskStmt(
+        graph_id, reshape, act0.region_id, col0.region_id, 1,
+        {1, config.in_channels, input_h_tile, config.in_w, config.kernel_h, config.kernel_w,
+         config.stride_h, config.stride_w, config.pad_h, config.pad_w, current_out_h_tile,
+         config.out_w, input_h_start, 0, out_h_start, 0},
+        rows * config.patch_size * 4, {last_input_dma}));
+
+    std::vector<int64_t> chunk_deps = {reshape};
+    for (int64_t oc_start = 0; oc_start < config.out_channels; oc_start += out_channel_chunk) {
+      int64_t current_oc_chunk =
+          std::min<int64_t>(out_channel_chunk, config.out_channels - oc_start);
+      int64_t chunk_output_elems = current_oc_chunk * plane_elems;
+      int64_t chunk_output_bytes = chunk_output_elems * 4;
+      int64_t dma_weight = next_task_id++;
+      int64_t matmul = next_task_id++;
+      int64_t transpose = next_task_id++;
+      stmts.push_back(
+          DMATaskStmt(graph_id, dma_weight, 0, weight->data, oc_start * config.patch_size * 4,
+                      wgt0.region_id, current_oc_chunk * config.patch_size * 4, chunk_deps));
+      stmts.push_back(MatmulTaskStmt(graph_id, matmul, col0.region_id, wgt0.region_id, aux0.region_id,
+                                     {rows, current_oc_chunk, config.patch_size}, 1,
+                                     {reshape, dma_weight}));
+      stmts.push_back(ReshapeTaskStmt(graph_id, transpose, aux0.region_id, act1.region_id, 2,
+                                      {rows, current_oc_chunk}, chunk_output_bytes, {matmul}));
+
+      std::vector<int64_t> stage_deps = {transpose};
+      int64_t bias_region_id = has_residual ? aux0.region_id : residual.region_id;
+      int64_t dma_bias = next_task_id++;
+      stmts.push_back(DMATaskStmt(graph_id, dma_bias, 0, bias->data, oc_start * 4, bias_region_id,
+                                  current_oc_chunk * 4, {transpose}));
+      stage_deps.push_back(dma_bias);
+
+      int64_t bias_add = next_task_id++;
+      stmts.push_back(VectorTaskStmt(graph_id, bias_add, 4, act1.region_id, bias_region_id,
+                                     act0.region_id, chunk_output_elems,
+                                     {current_oc_chunk, plane_elems}, stage_deps));
+      int64_t current_region_id = act0.region_id;
+      std::vector<int64_t> current_deps = {bias_add};
+
+      if (has_residual) {
+        int64_t dma_residual = next_task_id++;
+        int64_t residual_offset =
+            NCHWChannelOffsetBytes(oc_start, out_h_start, config.out_h, config.out_w);
+        int64_t residual_global_stride = NCHWChannelPlaneBytes(config.out_h, config.out_w);
+        stmts.push_back(BatchedDMATaskStmt(graph_id, dma_residual, 0, residual_input->data,
+                                           residual_offset, residual_global_stride,
+                                           residual.region_id, 0, plane_bytes, plane_bytes,
+                                           current_oc_chunk, chunk_deps));
+        int64_t residual_add = next_task_id++;
+        stmts.push_back(VectorTaskStmt(graph_id, residual_add, 0, act0.region_id, residual.region_id,
+                                       act1.region_id, chunk_output_elems, {},
+                                       {bias_add, dma_residual}));
+        current_region_id = act1.region_id;
+        current_deps = {residual_add};
+      }
+
+      if (has_relu) {
+        int64_t relu = next_task_id++;
+        int64_t relu_out_region = current_region_id == act0.region_id ? act1.region_id : act0.region_id;
+        stmts.push_back(VectorTaskStmt(graph_id, relu, 1, current_region_id, -1, relu_out_region,
+                                       chunk_output_elems, {}, current_deps));
+        current_region_id = relu_out_region;
+        current_deps = {relu};
+      }
+
+      std::vector<int64_t> output_dma_ids;
+      output_dma_ids.reserve(current_oc_chunk);
+      for (int64_t oc = 0; oc < current_oc_chunk; ++oc) {
+        int64_t dma_output = next_task_id++;
+        stmts.push_back(DMATaskStmt(
+            graph_id, dma_output, 1, output->data,
+            NCHWChannelOffsetBytes(oc_start + oc, out_h_start, config.out_h, config.out_w),
+            current_region_id, NCHWChannelPlaneBytes(current_out_h_tile, config.out_w), current_deps,
+            oc * NCHWChannelPlaneBytes(current_out_h_tile, config.out_w)));
+        output_dma_ids.push_back(dma_output);
+      }
+      chunk_deps = std::move(output_dma_ids);
+    }
+    carry_deps = std::move(chunk_deps);
+  }
+
+  stmts.push_back(SubmitGraphStmt(graph_id));
+  stmts.push_back(WaitGraphStmt(graph_id));
+  auto* n = func.CopyOnWrite();
+  n->body = SeqStmt(stmts);
+  return func;
+}
+
+std::optional<PrimFunc> MaybeBuildSemanticFunction(PrimFunc func, const std::string& op_family) {
+  if (op_family == "conv_bias") {
+    return BuildSemanticConvBody(std::move(func), false, false);
+  }
+  if (op_family == "conv_bias_relu") {
+    return BuildSemanticConvBody(std::move(func), false, true);
+  }
+  if (op_family == "conv_bias_residual") {
+    return BuildSemanticConvBody(std::move(func), true, false);
+  }
+  if (op_family == "conv_bias_residual_relu") {
+    return BuildSemanticConvBody(std::move(func), true, true);
+  }
+  if (op_family == "matmul_bias") {
+    return BuildDenseMatmulBiasBody(std::move(func));
+  }
+  if (op_family == "max_pool") {
+    return BuildMaxPoolBody(std::move(func));
+  }
+  if (op_family == "global_avg_pool") {
+    return BuildGlobalAveragePoolBody(std::move(func));
+  }
+  if (op_family == "transpose") {
+    return BuildTransposeCopyBody(std::move(func));
+  }
+  if (op_family == "reshape" || op_family == "copy") {
+    return BuildChunkedCopyBody(std::move(func));
+  }
+  return std::nullopt;
 }
 
 std::optional<PrimFunc> MaybeBuildCanonicalFunction(PrimFunc func) {
@@ -2118,6 +2508,39 @@ Pass BuildTyphoonGraph() {
   auto pass_func = [](IRModule mod, PassContext ctx) {
     if (!HasTyphoonPrimFunc(mod)) {
       return mod;
+    }
+
+    auto graph_plan = mod->GetAttr<ffi::String>("typhoon_graph_plan");
+    if (graph_plan.has_value()) {
+      std::unordered_map<std::string, SemanticNodePlan> nodes_by_symbol;
+      for (const SemanticNodePlan& node : ParseSemanticNodePlans(graph_plan.value())) {
+        nodes_by_symbol[node.symbol] = node;
+      }
+      if (!nodes_by_symbol.empty()) {
+        IRModule updated = mod;
+        auto* write_ptr = updated.CopyOnWrite();
+        for (const auto& [gvar, base_func] : mod->functions) {
+          const auto* func = base_func.as<PrimFuncNode>();
+          if (func == nullptr) {
+            continue;
+          }
+          PrimFunc prim_func = ffi::GetRef<PrimFunc>(func);
+          auto target = prim_func->GetAttr<Target>(tvm::attr::kTarget);
+          if (!target.defined() || target.value()->kind->name != "typhoon") {
+            continue;
+          }
+          std::string symbol = GlobalSymbol(prim_func);
+          auto it = nodes_by_symbol.find(symbol);
+          if (it == nodes_by_symbol.end()) {
+            continue;
+          }
+          auto rewritten = MaybeBuildSemanticFunction(prim_func, it->second.op_family);
+          if (rewritten.has_value()) {
+            write_ptr->Update(gvar, rewritten.value());
+          }
+        }
+        return updated;
+      }
     }
 
     auto resnet_plan = mod->GetAttr<ffi::String>("typhoon_resnet18_plan");

@@ -38,8 +38,10 @@ def _bind_typhoon_target(mod):
     return tvm.IRModule(functions, attrs=mod.attrs)
 
 
-def build_targeted_canonical_resnet18_tir_module():
-    return _bind_typhoon_target(build_canonical_resnet18_tir_module())
+def build_targeted_canonical_resnet18_tir_module(*, use_fused_pipeline=False):
+    return _bind_typhoon_target(
+        build_canonical_resnet18_vm_tir_module(use_fused_pipeline=use_fused_pipeline)
+    )
 
 
 def build_resnet18_plan_module():

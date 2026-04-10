@@ -47,6 +47,11 @@ def _module_has_typhoon_graph_ir(mod):
 
 def _run_typhoon_graph_build(mod):
     attrs = mod.attrs or {}
+    if "typhoon_graph_plan" not in attrs:
+        mod = tirx.transform.IdentifyTyphoonGraph()(mod)
+        attrs = mod.attrs or {}
+    if "typhoon_graph_plan" in attrs:
+        return tirx.transform.BuildTyphoonGraph()(mod)
     if "typhoon_resnet18_plan" not in attrs:
         mod = tirx.transform.IdentifyTyphoonResNet18()(mod)
         attrs = mod.attrs or {}
@@ -93,7 +98,7 @@ def _maybe_build_typhoon_graph(mod, _ctx):
         {**dict(mod.functions), helper_gvar: helper_func},
         attrs=mod.attrs,
     )
-    for key in ("typhoon_resnet18_plan", "typhoon_sram_plan"):
+    for key in ("typhoon_graph_plan", "typhoon_resnet18_plan", "typhoon_sram_plan"):
         if built.attrs and key in built.attrs:
             merged = merged.with_attr(key, built.attrs[key])
     return merged

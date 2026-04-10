@@ -393,6 +393,17 @@ def IdentifyTyphoonResNet18():
     return _ffi_api.IdentifyTyphoonResNet18()  # type: ignore
 
 
+def IdentifyTyphoonGraph():
+    """Identify general standalone Typhoon-compatible fused PrimFuncs.
+
+    Returns
+    -------
+    fpass : tvm.transform.Pass
+        The result pass
+    """
+    return _ffi_api.IdentifyTyphoonGraph()  # type: ignore
+
+
 def PlanTyphoonSRAM():
     """Plan fixed SRAM regions and tiles for Typhoon ResNet18 lowering.
 

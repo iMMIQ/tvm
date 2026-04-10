@@ -31,6 +31,7 @@ from tests.python.relax.typhoon_resnet18_test_utils import (
     assert_elementwise_close_with_context,
     build_canonical_resnet18_feed_dict,
     build_canonical_resnet18_vm_executable,
+    build_canonical_resnet18_vm_tir_module,
     format_first_mismatch,
     import_canonical_resnet18_relax_module,
     load_canonical_resnet18_model,
@@ -100,7 +101,7 @@ def _assert_resnet18_typhoon_source_contract(source):
 def test_relax_resnet18_compiles_to_typhoon_graph():
     model = load_canonical_resnet18_model()
     mod = import_canonical_resnet18_relax_module(model)
-    ex, source = build_canonical_resnet18_vm_executable(mod)
+    ex, source = build_canonical_resnet18_vm_executable(mod, use_fused_pipeline=False)
     assert isinstance(ex, vm_build.VMExecutable)
     _assert_resnet18_typhoon_source_contract(source)
 
@@ -114,7 +115,7 @@ def test_relax_resnet18_runs_in_typhoon_simulator():
     assert reset is not None
     assert get_trace is not None
     reset()
-    executable, source = build_canonical_resnet18_vm_executable(mod)
+    executable, source = build_canonical_resnet18_vm_executable(mod, use_fused_pipeline=False)
     output = run_canonical_resnet18_on_typhoon(feed_dict, mod, executable=executable)
     ref = run_canonical_resnet18_reference_onnxruntime(feed_dict, model)
     trace = json.loads(get_trace())
@@ -138,7 +139,7 @@ def test_relax_resnet18_compact_replay_reduces_dma_and_makespan():
     assert get_stats is not None
 
     reset()
-    executable, _ = build_canonical_resnet18_vm_executable(mod)
+    executable, _ = build_canonical_resnet18_vm_executable(mod, use_fused_pipeline=False)
     output = run_canonical_resnet18_on_typhoon(feed_dict, mod, executable=executable)
     ref = run_canonical_resnet18_reference_onnxruntime(feed_dict, model)
     trace = json.loads(get_trace())
@@ -153,7 +154,7 @@ def test_run_canonical_resnet18_on_typhoon_reuses_prebuilt_executable(monkeypatc
     model = load_canonical_resnet18_model()
     mod = import_canonical_resnet18_relax_module(model)
     feed_dict = build_canonical_resnet18_feed_dict(model)
-    exe, _ = build_canonical_resnet18_vm_executable(mod)
+    exe, _ = build_canonical_resnet18_vm_executable(mod, use_fused_pipeline=False)
 
     def _unexpected_rebuild(*args, **kwargs):
         raise AssertionError("run_canonical_resnet18_on_typhoon should reuse the provided executable")
@@ -217,6 +218,23 @@ def test_typhoon_resnet18_test_utils_loads_canonical_model():
 
     model = load_canonical_resnet18_model()
     assert model is not None
+
+
+def test_typhoon_resnet18_vm_tir_module_uses_fused_pipeline_by_default():
+    mod = build_canonical_resnet18_vm_tir_module()
+    names = [gvar.name_hint for gvar in mod.get_global_vars()]
+    assert "fused_conv2d_add_relu" in names
+    assert "fused_matmul_add9" in names
+
+
+def test_relax_resnet18_default_typhoon_build_uses_fused_graph_kernels():
+    model = load_canonical_resnet18_model()
+    mod = import_canonical_resnet18_relax_module(model)
+    ex, source = build_canonical_resnet18_vm_executable(mod)
+    assert isinstance(ex, vm_build.VMExecutable)
+    assert "TVMTyphoonGraphBegin" in source
+    assert "TVMTyphoonReplayWholeGraphBegin" not in source
+    assert "fused_conv2d_add_relu" in source
 
 
 def test_relax_typhoon_reports_first_mismatch_context():
