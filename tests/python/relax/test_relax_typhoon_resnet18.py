@@ -126,6 +126,29 @@ def test_relax_resnet18_runs_in_typhoon_simulator():
     tvm.testing.assert_allclose(output, ref, rtol=1e-4, atol=1e-4)
 
 
+def test_relax_resnet18_compact_replay_reduces_dma_and_makespan():
+    model = load_canonical_resnet18_model()
+    mod = import_canonical_resnet18_relax_module(model)
+    feed_dict = build_canonical_resnet18_feed_dict(model)
+    reset = tvm.get_global_func("runtime.typhoon.testing_reset", allow_missing=True)
+    get_trace = tvm.get_global_func("runtime.typhoon_get_last_trace_json", allow_missing=True)
+    get_stats = tvm.get_global_func("runtime.typhoon_get_last_graph_stats_json", allow_missing=True)
+    assert reset is not None
+    assert get_trace is not None
+    assert get_stats is not None
+
+    reset()
+    executable, _ = build_canonical_resnet18_vm_executable(mod)
+    output = run_canonical_resnet18_on_typhoon(feed_dict, mod, executable=executable)
+    ref = run_canonical_resnet18_reference_onnxruntime(feed_dict, model)
+    trace = json.loads(get_trace())
+    stats = json.loads(get_stats())
+
+    tvm.testing.assert_allclose(output, ref, rtol=1e-4, atol=1e-4)
+    assert stats["dma"] < 4853, stats
+    assert max(record["end_time"] for record in trace) < 24290606, trace[-1]
+
+
 def test_run_canonical_resnet18_on_typhoon_reuses_prebuilt_executable(monkeypatch):
     model = load_canonical_resnet18_model()
     mod = import_canonical_resnet18_relax_module(model)
