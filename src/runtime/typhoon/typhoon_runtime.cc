@@ -723,24 +723,13 @@ class TyphoonRuntimeState {
       }
       auto& pending = state.replay.pending_layer;
       if (pending.present) {
-        const DLTensor* fused_relu_output = nullptr;
-        bool fused_relu =
-            replay_kind == kReplayRelu &&
-            CanFusePendingLayerIntoRelu(state, pending.layer_id, pending.replay_kind, layer_id,
-                                        &fused_relu_output);
-
         state.graph.SetCurrentLayerId(pending.layer_id);
         struct ResetCurrentLayerId {
           TyphoonGraphBuilder* graph;
           ~ResetCurrentLayerId() { graph->SetCurrentLayerId(-1); }
         } reset_current_layer_id{&state.graph};
-        ExecuteReplayLayer(&state, pending.layer_id, pending.replay_kind,
-                           fused_relu ? fused_relu_output : nullptr);
+        ExecuteReplayLayer(&state, pending.layer_id, pending.replay_kind);
         pending = CanonicalReplayState::PendingLayer{};
-        if (fused_relu) {
-          state.replay.skipped_layer_ids.insert(layer_id);
-          return;
-        }
         if (state.replay.skipped_layer_ids.count(layer_id) != 0) {
           return;
         }
@@ -922,56 +911,6 @@ class TyphoonRuntimeState {
     }
   }
 
-  static int32_t OutputHandleIndexForReplayKind(int32_t replay_kind) {
-    switch (replay_kind) {
-      case kReplayConv2D:
-      case kReplayAdd:
-      case kReplayDenseMatmul:
-        return 2;
-      case kReplayRelu:
-      case kReplayMaxPool:
-      case kReplayGlobalAveragePool:
-      case kReplayCopy:
-        return 1;
-      default:
-        throw std::runtime_error("Typhoon replay kind " + std::to_string(replay_kind) +
-                                 " has no known output handle");
-    }
-  }
-
-  static bool SupportsReluFusion(int32_t replay_kind) {
-    switch (replay_kind) {
-      case kReplayConv2D:
-      case kReplayAdd:
-      case kReplayCopy:
-      case kReplayMaxPool:
-      case kReplayGlobalAveragePool:
-        return true;
-      default:
-        return false;
-    }
-  }
-
-  static bool CanFusePendingLayerIntoRelu(const GraphRuntimeState& state, int32_t pending_layer_id,
-                                          int32_t pending_replay_kind, int32_t relu_layer_id,
-                                          const DLTensor** fused_output) {
-    if (!SupportsReluFusion(pending_replay_kind)) {
-      return false;
-    }
-    const DLTensor* pending_output =
-        GetCapturedTensor(state, pending_layer_id, OutputHandleIndexForReplayKind(pending_replay_kind));
-    const DLTensor* relu_input = GetCapturedTensor(state, relu_layer_id, 0);
-    const DLTensor* relu_output = GetCapturedTensor(state, relu_layer_id, 1);
-    if (pending_output->data != relu_input->data) {
-      return false;
-    }
-    if (!SameShape(pending_output, relu_input) || !SameShape(pending_output, relu_output)) {
-      return false;
-    }
-    *fused_output = relu_output;
-    return true;
-  }
-
   static void AddDMATask(GraphRuntimeState* state, int32_t direction, void* global_handle,
                          int64_t global_byte_offset, int32_t sram_region_id, int64_t bytes,
                          const std::vector<int32_t>& deps, int64_t sram_byte_offset = 0) {
@@ -1091,13 +1030,11 @@ class TyphoonRuntimeState {
     state->replay.prev_segment_deps = std::move(carry_deps);
   }
 
-  static void ReplayCopyLayer(GraphRuntimeState* state, int32_t layer_id,
-                              const DLTensor* fused_relu_output = nullptr) {
+  static void ReplayCopyLayer(GraphRuntimeState* state, int32_t layer_id) {
     const CanonicalRegionSpec& act0 = FindCanonicalRegion("act0");
     const CanonicalRegionSpec& act1 = FindCanonicalRegion("act1");
     const DLTensor* input = GetCapturedTensor(*state, layer_id, 0);
-    const DLTensor* output =
-        fused_relu_output != nullptr ? fused_relu_output : GetCapturedTensor(*state, layer_id, 1);
+    const DLTensor* output = GetCapturedTensor(*state, layer_id, 1);
     int64_t total_bytes = TensorBytes(input);
     std::vector<int32_t> carry_deps = state->replay.prev_segment_deps;
     for (int64_t offset = 0; offset < total_bytes; offset += act0.size) {
@@ -1106,29 +1043,20 @@ class TyphoonRuntimeState {
           AddDMATaskReturningId(state, 0, input->data, offset, act0.region_id, chunk_bytes, carry_deps);
       int32_t reshape =
           AddReshapeTask(state, act0.region_id, act1.region_id, chunk_bytes, 0, {}, {dma_in});
-      int32_t chunk_sink = reshape;
-      int32_t output_region_id = act1.region_id;
-      if (fused_relu_output != nullptr) {
-        chunk_sink = AddVectorTask(state, 1, act1.region_id, -1, act0.region_id, chunk_bytes / 4, {},
-                                   {reshape});
-        output_region_id = act0.region_id;
-      }
       int32_t dma_out =
-          AddDMATaskReturningId(state, 1, output->data, offset, output_region_id, chunk_bytes, {chunk_sink});
+          AddDMATaskReturningId(state, 1, output->data, offset, act1.region_id, chunk_bytes, {reshape});
       carry_deps = {dma_out};
     }
     state->replay.prev_segment_deps = std::move(carry_deps);
   }
 
-  static void ReplayAddLayer(GraphRuntimeState* state, int32_t layer_id,
-                             const DLTensor* fused_relu_output = nullptr) {
+  static void ReplayAddLayer(GraphRuntimeState* state, int32_t layer_id) {
     const CanonicalRegionSpec& act0 = FindCanonicalRegion("act0");
     const CanonicalRegionSpec& act1 = FindCanonicalRegion("act1");
     const CanonicalRegionSpec& residual = FindCanonicalRegion("residual");
     const DLTensor* lhs = GetCapturedTensor(*state, layer_id, 0);
     const DLTensor* rhs = GetCapturedTensor(*state, layer_id, 1);
-    const DLTensor* output =
-        fused_relu_output != nullptr ? fused_relu_output : GetCapturedTensor(*state, layer_id, 2);
+    const DLTensor* output = GetCapturedTensor(*state, layer_id, 2);
     int64_t lhs_bytes = TensorBytes(lhs);
     int64_t rhs_bytes = TensorBytes(rhs);
     std::vector<int64_t> lhs_shape = ShapeOf(lhs);
@@ -1173,15 +1101,8 @@ class TyphoonRuntimeState {
                                                 chunk_bytes, carry_deps);
         int32_t vector = AddVectorTask(state, 0, act0.region_id, residual.region_id, act1.region_id,
                                        chunk_bytes / 4, {}, {dma_lhs, dma_rhs});
-        int32_t chunk_sink = vector;
-        int32_t output_region_id = act1.region_id;
-        if (fused_relu_output != nullptr) {
-          chunk_sink = AddVectorTask(state, 1, act1.region_id, -1, act0.region_id, chunk_bytes / 4, {},
-                                     {vector});
-          output_region_id = act0.region_id;
-        }
         int32_t dma_out =
-            AddDMATaskReturningId(state, 1, output->data, offset, output_region_id, chunk_bytes, {chunk_sink});
+            AddDMATaskReturningId(state, 1, output->data, offset, act1.region_id, chunk_bytes, {vector});
         carry_deps = {dma_out};
       }
     } else if (channel_bias_broadcast) {
@@ -1207,16 +1128,9 @@ class TyphoonRuntimeState {
           int32_t vector = AddVectorTask(state, 4, act0.region_id, residual.region_id,
                                          act1.region_id, c * plane_elems, {c, plane_elems},
                                          {dma_lhs, dma_rhs});
-          int32_t chunk_sink = vector;
-          int32_t output_region_id = act1.region_id;
-          if (fused_relu_output != nullptr) {
-            chunk_sink = AddVectorTask(state, 1, act1.region_id, -1, act0.region_id, c * plane_elems,
-                                       {}, {vector});
-            output_region_id = act0.region_id;
-          }
           int32_t dma_out = AddBatchedDMATaskReturningId(
-              state, 1, output->data, plane_offset, plane_bytes, output_region_id, 0, plane_bytes,
-              plane_bytes, c, {chunk_sink});
+              state, 1, output->data, plane_offset, plane_bytes, act1.region_id, 0, plane_bytes,
+              plane_bytes, c, {vector});
           carry_deps = {dma_out};
         }
       }
@@ -1236,28 +1150,19 @@ class TyphoonRuntimeState {
         int32_t vector =
             AddVectorTask(state, 0, act0.region_id, residual.region_id, act1.region_id,
                           chunk_bytes / 4, {outer, inner}, {dma_lhs, dma_rhs});
-        int32_t chunk_sink = vector;
-        int32_t output_region_id = act1.region_id;
-        if (fused_relu_output != nullptr) {
-          chunk_sink = AddVectorTask(state, 1, act1.region_id, -1, act0.region_id, chunk_bytes / 4, {},
-                                     {vector});
-          output_region_id = act0.region_id;
-        }
-        int32_t dma_out = AddDMATaskReturningId(state, 1, output->data, global_offset, output_region_id,
-                                               chunk_bytes, {chunk_sink});
+        int32_t dma_out = AddDMATaskReturningId(state, 1, output->data, global_offset, act1.region_id,
+                                               chunk_bytes, {vector});
         carry_deps = {dma_out};
       }
     }
     state->replay.prev_segment_deps = std::move(carry_deps);
   }
 
-  static void ReplayMaxPoolLayer(GraphRuntimeState* state, int32_t layer_id,
-                                 const DLTensor* fused_relu_output = nullptr) {
+  static void ReplayMaxPoolLayer(GraphRuntimeState* state, int32_t layer_id) {
     const CanonicalRegionSpec& act0 = FindCanonicalRegion("act0");
     const CanonicalRegionSpec& act1 = FindCanonicalRegion("act1");
     const DLTensor* input = GetCapturedTensor(*state, layer_id, 0);
-    const DLTensor* output =
-        fused_relu_output != nullptr ? fused_relu_output : GetCapturedTensor(*state, layer_id, 1);
+    const DLTensor* output = GetCapturedTensor(*state, layer_id, 1);
     std::vector<int64_t> in_shape = ShapeOf(input);
     std::vector<int64_t> out_shape = ShapeOf(output);
     int64_t in_h = in_shape[2];
@@ -1278,27 +1183,18 @@ class TyphoonRuntimeState {
           AddDMATaskReturningId(state, 0, input->data, input_offset, act0.region_id, input_bytes, carry_deps);
       int32_t vector = AddVectorTask(state, 2, act0.region_id, -1, act1.region_id, c * out_h * out_w,
                                      {1, c, in_h, in_w, 3, 3, 2, 2, 1, 1, out_h, out_w}, {dma_in});
-      int32_t chunk_sink = vector;
-      int32_t output_region_id = act1.region_id;
-      if (fused_relu_output != nullptr) {
-        chunk_sink =
-            AddVectorTask(state, 1, act1.region_id, -1, act0.region_id, c * out_h * out_w, {}, {vector});
-        output_region_id = act0.region_id;
-      }
-      int32_t dma_out = AddDMATaskReturningId(state, 1, output->data, output_offset, output_region_id,
-                                             output_bytes, {chunk_sink});
+      int32_t dma_out = AddDMATaskReturningId(state, 1, output->data, output_offset, act1.region_id,
+                                             output_bytes, {vector});
       carry_deps = {dma_out};
     }
     state->replay.prev_segment_deps = std::move(carry_deps);
   }
 
-  static void ReplayGlobalAveragePoolLayer(GraphRuntimeState* state, int32_t layer_id,
-                                           const DLTensor* fused_relu_output = nullptr) {
+  static void ReplayGlobalAveragePoolLayer(GraphRuntimeState* state, int32_t layer_id) {
     const CanonicalRegionSpec& act0 = FindCanonicalRegion("act0");
     const CanonicalRegionSpec& act1 = FindCanonicalRegion("act1");
     const DLTensor* input = GetCapturedTensor(*state, layer_id, 0);
-    const DLTensor* output =
-        fused_relu_output != nullptr ? fused_relu_output : GetCapturedTensor(*state, layer_id, 1);
+    const DLTensor* output = GetCapturedTensor(*state, layer_id, 1);
     std::vector<int64_t> in_shape = ShapeOf(input);
     int64_t c_total = in_shape[1];
     int64_t in_h = in_shape[2];
@@ -1316,14 +1212,8 @@ class TyphoonRuntimeState {
           AddDMATaskReturningId(state, 0, input->data, input_offset, act0.region_id, input_bytes, carry_deps);
       int32_t vector =
           AddVectorTask(state, 3, act0.region_id, -1, act1.region_id, c, {1, c, in_h, in_w}, {dma_in});
-      int32_t chunk_sink = vector;
-      int32_t output_region_id = act1.region_id;
-      if (fused_relu_output != nullptr) {
-        chunk_sink = AddVectorTask(state, 1, act1.region_id, -1, act0.region_id, c, {}, {vector});
-        output_region_id = act0.region_id;
-      }
-      int32_t dma_out = AddDMATaskReturningId(state, 1, output->data, output_offset, output_region_id,
-                                             output_bytes, {chunk_sink});
+      int32_t dma_out = AddDMATaskReturningId(state, 1, output->data, output_offset, act1.region_id,
+                                             output_bytes, {vector});
       carry_deps = {dma_out};
     }
     state->replay.prev_segment_deps = std::move(carry_deps);
@@ -1408,8 +1298,7 @@ class TyphoonRuntimeState {
     state->replay.prev_segment_deps = std::move(carry_deps);
   }
 
-  static void ReplayConv2DLayer(GraphRuntimeState* state, int32_t layer_id,
-                                const DLTensor* fused_relu_output = nullptr) {
+  static void ReplayConv2DLayer(GraphRuntimeState* state, int32_t layer_id) {
     const CanonicalRegionSpec& act0 = FindCanonicalRegion("act0");
     const CanonicalRegionSpec& act1 = FindCanonicalRegion("act1");
     const CanonicalRegionSpec& wgt0 = FindCanonicalRegion("wgt0");
@@ -1484,18 +1373,10 @@ class TyphoonRuntimeState {
             AddReshapeTask(state, aux0.region_id, act1.region_id, rows * current_oc_chunk * 4, 2,
                            {rows, current_oc_chunk}, {matmul});
         int64_t output_plane_bytes = NCHWChannelPlaneBytes(current_out_h_tile, out_w);
-        int32_t chunk_sink = transpose;
-        int32_t output_region_id = act1.region_id;
-        if (fused_relu_output != nullptr) {
-          chunk_sink =
-              AddVectorTask(state, 1, act1.region_id, -1, act0.region_id, rows * current_oc_chunk, {},
-                            {transpose});
-          output_region_id = act0.region_id;
-        }
         int32_t output_dma = AddBatchedDMATaskReturningId(
             state, 1, output->data, NCHWChannelOffsetBytes(oc_start, out_h_start, out_h, out_w),
-            NCHWChannelPlaneBytes(out_h, out_w), output_region_id, 0, output_plane_bytes,
-            output_plane_bytes, current_oc_chunk, {chunk_sink});
+            NCHWChannelPlaneBytes(out_h, out_w), act1.region_id, 0, output_plane_bytes,
+            output_plane_bytes, current_oc_chunk, {transpose});
         chunk_deps = {output_dma};
       }
       carry_deps = std::move(chunk_deps);
@@ -1503,35 +1384,28 @@ class TyphoonRuntimeState {
     state->replay.prev_segment_deps = std::move(carry_deps);
   }
 
-  static void ExecuteReplayLayer(GraphRuntimeState* state, int32_t layer_id, int32_t replay_kind,
-                                 const DLTensor* fused_relu_output = nullptr) {
+  static void ExecuteReplayLayer(GraphRuntimeState* state, int32_t layer_id, int32_t replay_kind) {
     switch (replay_kind) {
       case kReplayConv2D:
-        ReplayConv2DLayer(state, layer_id, fused_relu_output);
+        ReplayConv2DLayer(state, layer_id);
         return;
       case kReplayRelu:
-        if (fused_relu_output != nullptr) {
-          throw std::runtime_error("Typhoon replay relu fusion target must be produced by another layer");
-        }
         ReplayReluLayer(state, layer_id);
         return;
       case kReplayAdd:
-        ReplayAddLayer(state, layer_id, fused_relu_output);
+        ReplayAddLayer(state, layer_id);
         return;
       case kReplayMaxPool:
-        ReplayMaxPoolLayer(state, layer_id, fused_relu_output);
+        ReplayMaxPoolLayer(state, layer_id);
         return;
       case kReplayGlobalAveragePool:
-        ReplayGlobalAveragePoolLayer(state, layer_id, fused_relu_output);
+        ReplayGlobalAveragePoolLayer(state, layer_id);
         return;
       case kReplayDenseMatmul:
-        if (fused_relu_output != nullptr) {
-          throw std::runtime_error("Typhoon replay relu fusion is unsupported after dense_matmul");
-        }
         ReplayDenseMatmulLayer(state, layer_id);
         return;
       case kReplayCopy:
-        ReplayCopyLayer(state, layer_id, fused_relu_output);
+        ReplayCopyLayer(state, layer_id);
         return;
       default:
         throw std::runtime_error("Typhoon replay kind " + std::to_string(replay_kind) +
