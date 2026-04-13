@@ -89,10 +89,6 @@ class CodeGenTyphoonHost final : public CodeGenCHost {
                   "int32_t)";
     } else if (global_symbol == "TVMTyphoonGetCapturedHandle") {
       signature = "void* TVMTyphoonGetCapturedHandle(int32_t, int32_t, int32_t)";
-    } else if (global_symbol == "TVMTyphoonReplayWholeGraphBegin") {
-      signature = "int32_t TVMTyphoonReplayWholeGraphBegin(int32_t)";
-    } else if (global_symbol == "TVMTyphoonReplayCapturedLayer") {
-      signature = "int32_t TVMTyphoonReplayCapturedLayer(int32_t, int32_t, int32_t)";
     } else if (global_symbol == "TVMTyphoonSubmitGraph") {
       signature = "int32_t TVMTyphoonSubmitGraph(int32_t)";
     } else if (global_symbol == "TVMTyphoonWaitGraph") {

@@ -50,15 +50,8 @@ def _run_typhoon_graph_build(mod):
     if "typhoon_graph_plan" not in attrs:
         mod = tirx.transform.IdentifyTyphoonGraph()(mod)
         attrs = mod.attrs or {}
-    if "typhoon_graph_plan" in attrs:
-        return tirx.transform.BuildTyphoonGraph()(mod)
-    if "typhoon_resnet18_plan" not in attrs:
-        mod = tirx.transform.IdentifyTyphoonResNet18()(mod)
-        attrs = mod.attrs or {}
-    if "typhoon_resnet18_plan" not in attrs:
+    if "typhoon_graph_plan" not in attrs:
         return None
-    if "typhoon_sram_plan" not in attrs:
-        mod = tirx.transform.PlanTyphoonSRAM()(mod)
     return tirx.transform.BuildTyphoonGraph()(mod)
 
 
@@ -98,7 +91,7 @@ def _maybe_build_typhoon_graph(mod, _ctx):
         {**dict(mod.functions), helper_gvar: helper_func},
         attrs=mod.attrs,
     )
-    for key in ("typhoon_graph_plan", "typhoon_resnet18_plan", "typhoon_sram_plan"):
+    for key in ("typhoon_graph_plan",):
         if built.attrs and key in built.attrs:
             merged = merged.with_attr(key, built.attrs[key])
     return merged
@@ -111,7 +104,6 @@ def finalize_host_passes():  # pylint: disable=unused-argument
         tirx.transform.LowerCustomDatatypes(),
         _maybe_build_typhoon_graph,
         tirx.transform.VerifyTyphoonGraph(),
-        tirx.transform.CompactTyphoonWholeGraph(),
         tirx.transform.LowerTyphoonTaskDeps(),
         tirx.transform.LowerTyphoonSubmitGraph(),
         tirx.transform.LowerIntrin(),

@@ -29,7 +29,7 @@ from tests.python.tirx_transform.typhoon_resnet18_test_utils import (
 
 
 def test_identify_typhoon_graph_builds_generic_graph_plan_from_fused_resnet18():
-    mod = build_targeted_canonical_resnet18_tir_module(use_fused_pipeline=True)
+    mod = build_targeted_canonical_resnet18_tir_module()
     out = tvm.tirx.transform.IdentifyTyphoonGraph()(mod)
     assert "typhoon_graph_plan" in out.attrs
 
@@ -52,7 +52,7 @@ def test_identify_typhoon_graph_builds_generic_graph_plan_from_fused_resnet18():
 
 
 def test_build_typhoon_graph_lowers_fused_semantic_functions_from_generic_plan():
-    mod = build_targeted_canonical_resnet18_tir_module(use_fused_pipeline=True)
+    mod = build_targeted_canonical_resnet18_tir_module()
     mod = tvm.tirx.transform.IdentifyTyphoonGraph()(mod)
     out = tvm.tirx.transform.BuildTyphoonGraph()(mod)
 
@@ -79,7 +79,7 @@ def _run_lowered_typhoon_primfunc(func, symbol):
 
 
 def test_build_typhoon_graph_preserves_numeric_behavior_for_fused_residual_conv():
-    mod = build_targeted_canonical_resnet18_tir_module(use_fused_pipeline=True)
+    mod = build_targeted_canonical_resnet18_tir_module()
     lowered = tvm.tirx.transform.BuildTyphoonGraph()(tvm.tirx.transform.IdentifyTyphoonGraph()(mod))
 
     symbol = "fused_conv2d1_add1_add2_relu1"

@@ -15,9 +15,9 @@
 # specific language governing permissions and limitations
 # under the License.
 
+import importlib
 import os
 import shutil
-import importlib
 
 import numpy as np
 import onnx
@@ -25,8 +25,6 @@ from onnx.numpy_helper import to_array
 
 TYPHOON_RESNET18_ENV = "TYPHOON_RESNET18_ONNX_PATH"
 DEFAULT_RESNET18_PATH = os.path.expanduser("~/model/resnet18.onnx")
-TYPHOON_USE_FUSED_PIPELINE_ENV = "TVM_TYPHOON_USE_FUSED_PIPELINE"
-
 
 def get_canonical_resnet18_model_path():
     model_path = os.environ.get(TYPHOON_RESNET18_ENV, DEFAULT_RESNET18_PATH)
@@ -92,22 +90,9 @@ def _jit_executable_for_host_runtime(executable):
     return executable.jit(fcompile=tvm_cc.create_shared, cc=cc_name)
 
 
-def _use_fused_pipeline_by_default():
-    value = os.environ.get(TYPHOON_USE_FUSED_PIPELINE_ENV)
-    if value is None:
-        return True
-    return value.lower() not in ("0", "false", "off", "no")
-
-
-def build_typhoon_relax_pipeline(*, use_fused_pipeline=None):
+def build_typhoon_relax_pipeline():
     from tvm import relax
     import tvm
-
-    use_fused_pipeline = (
-        _use_fused_pipeline_by_default() if use_fused_pipeline is None else use_fused_pipeline
-    )
-    if not use_fused_pipeline:
-        return relax.get_pipeline("default")
 
     return tvm.transform.Sequential(
         [
@@ -129,26 +114,26 @@ def build_typhoon_relax_pipeline(*, use_fused_pipeline=None):
     )
 
 
-def build_canonical_resnet18_vm_tir_module(mod=None, *, use_fused_pipeline=None):
+def build_canonical_resnet18_vm_tir_module(mod=None):
     from tvm import relax
     from tvm.relax import vm_build
     import tvm
 
     mod = mod or import_canonical_resnet18_relax_module()
     with tvm.target.Target({"kind": "typhoon"}):
-        lowered = build_typhoon_relax_pipeline(use_fused_pipeline=use_fused_pipeline)(mod)
+        lowered = build_typhoon_relax_pipeline()(mod)
     builder = relax.ExecBuilder()
     return vm_build._vmcodegen(builder, lowered, exec_mode="bytecode")
 
 
-def build_canonical_resnet18_vm_executable(mod=None, *, use_fused_pipeline=None):
+def build_canonical_resnet18_vm_executable(mod=None):
     from tvm import relax
     from tvm.relax import vm_build
     import tvm
 
     mod = mod or import_canonical_resnet18_relax_module()
     with tvm.target.Target({"kind": "typhoon"}):
-        lowered = build_typhoon_relax_pipeline(use_fused_pipeline=use_fused_pipeline)(mod)
+        lowered = build_typhoon_relax_pipeline()(mod)
     builder = relax.ExecBuilder()
     tir_mod = vm_build._vmcodegen(builder, lowered, exec_mode="bytecode")
     lib = tvm.tirx.build(tir_mod, target=tvm.target.Target({"kind": "typhoon"}))

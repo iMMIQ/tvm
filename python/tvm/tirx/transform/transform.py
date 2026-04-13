@@ -426,17 +426,6 @@ def BuildTyphoonGraph():
     return _ffi_api.BuildTyphoonGraph()  # type: ignore
 
 
-def CompactTyphoonWholeGraph():
-    """Replace the verified whole-graph Typhoon task expansion with replay helper calls.
-
-    Returns
-    -------
-    fpass : tvm.transform.Pass
-        The result pass
-    """
-    return _ffi_api.CompactTyphoonWholeGraph()  # type: ignore
-
-
 def LowerTyphoonSubmitGraph():
     """Expand Typhoon submit_graph nodes into GraphBegin + SubmitGraph statements.
 

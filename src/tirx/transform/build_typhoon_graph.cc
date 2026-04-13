@@ -1413,88 +1413,6 @@ ffi::Array<Stmt> BuildPlannedWholeGraphStmts(
   return stmts;
 }
 
-int32_t CanonicalReplayKindCode(const PlannedLayer& layer) {
-  if (layer.kind == "conv2d") {
-    return 1;
-  }
-  if (layer.kind == "relu") {
-    return 2;
-  }
-  if (layer.kind == "bias_add" || layer.kind == "add" || layer.kind == "residual_add") {
-    return 3;
-  }
-  if (layer.kind == "max_pool2d") {
-    return 4;
-  }
-  if (layer.kind == "global_avg_pool") {
-    return 5;
-  }
-  if (layer.kind == "matmul") {
-    return 6;
-  }
-  if (layer.kind == "transpose" || layer.kind == "reshape") {
-    return 7;
-  }
-  TVM_FFI_THROW(ValueError) << "BuildTyphoonGraph does not support replay kind `" << layer.kind
-                            << "`";
-  return 0;
-}
-
-bool IsPackedFFISymbol(const std::string& symbol) {
-  static constexpr const char* kPackedFFIPrefix = "__tvm_ffi_";
-  return symbol.rfind(kPackedFFIPrefix, 0) == 0;
-}
-
-Stmt ReplayWholeGraphBeginStmt(int64_t graph_id) {
-  ffi::Array<PrimExpr> args{StringImm("TVMTyphoonReplayWholeGraphBegin"), Int32Const(graph_id)};
-  return Evaluate(Call(DataType::Int(32), builtin::call_extern(), args));
-}
-
-Stmt ReplayCapturedLayerStmt(int64_t graph_id, int64_t layer_id, int32_t replay_kind_code) {
-  ffi::Array<PrimExpr> args{StringImm("TVMTyphoonReplayCapturedLayer"), Int32Const(graph_id),
-                            Int32Const(layer_id), Int32Const(replay_kind_code)};
-  return Evaluate(Call(DataType::Int(32), builtin::call_extern(), args));
-}
-
-ffi::Array<Stmt> BuildReplayWholeGraphStmts(int64_t graph_id, const PrimFunc& final_func,
-                                            const std::vector<PlannedLayer>& layers) {
-  ffi::Array<Stmt> stmts;
-  std::vector<int64_t> final_layer_ids{layers.back().layer_id};
-  bool is_packed_ffi = IsPackedFFISymbol(GlobalSymbol(final_func));
-  if (is_packed_ffi) {
-    stmts.push_back(CapturePackedArgsStmt(graph_id, final_layer_ids, final_func));
-  } else {
-    stmts.push_back(CaptureCallStmt(graph_id, final_layer_ids, final_func));
-  }
-  stmts.push_back(ReplayWholeGraphBeginStmt(graph_id));
-  for (const PlannedLayer& layer : layers) {
-    stmts.push_back(
-        ReplayCapturedLayerStmt(graph_id, layer.layer_id, CanonicalReplayKindCode(layer)));
-  }
-  stmts.push_back(SubmitGraphStmt(graph_id));
-  stmts.push_back(WaitGraphStmt(graph_id));
-  if (is_packed_ffi) {
-    stmts.push_back(Evaluate(ret(Integer(0))));
-  }
-  return stmts;
-}
-
-bool MatchesPlannedSymbol(const std::string& actual_symbol, const std::string& planned_symbol) {
-  if (actual_symbol == planned_symbol) {
-    return true;
-  }
-  static constexpr const char* kPackedFFIPrefix = "__tvm_ffi_";
-  if (actual_symbol.rfind(kPackedFFIPrefix, 0) == 0) {
-    return actual_symbol.substr(std::strlen(kPackedFFIPrefix)) == planned_symbol;
-  }
-  return false;
-}
-
-bool IsFullGraphRecognitionPlan(const std::string& plan) {
-  return plan.find("\"recognized_scope\":\"full_graph\"") != std::string::npos ||
-         plan.find("\"recognized_scope\": \"full_graph\"") != std::string::npos;
-}
-
 std::vector<int64_t> OffsetTaskIds(const std::vector<int64_t>& task_ids, int64_t offset) {
   std::vector<int64_t> rewritten;
   rewritten.reserve(task_ids.size());
@@ -2556,15 +2474,11 @@ Pass BuildTyphoonGraph() {
     int64_t graph_id = 0;
     bool single_function = mod->functions.size() == 1;
     std::vector<PlannedLayer> planned_layers;
-    bool full_graph_plan = IsFullGraphRecognitionPlan(resnet_plan.value());
-    std::vector<RegionSpec> placement_regions =
-        full_graph_plan ? std::vector<RegionSpec>{} : ExtractPlacementRegions(sram_plan.value());
+    std::vector<RegionSpec> placement_regions = ExtractPlacementRegions(sram_plan.value());
     std::unordered_map<int64_t, int64_t> placement_region_by_storage =
-        full_graph_plan ? std::unordered_map<int64_t, int64_t>{}
-                        : ExtractPlacementRegionByStorage(sram_plan.value());
+        ExtractPlacementRegionByStorage(sram_plan.value());
     std::unordered_map<int64_t, LayerOperandBinding> layer_operand_bindings =
-        full_graph_plan ? std::unordered_map<int64_t, LayerOperandBinding>{}
-                        : ExtractLayerOperandBindings(sram_plan.value());
+        ExtractLayerOperandBindings(sram_plan.value());
     if (!single_function) {
       planned_layers = ParsePlannedLayers(resnet_plan.value());
     }
@@ -2598,7 +2512,7 @@ Pass BuildTyphoonGraph() {
         continue;
       }
       typhoon_funcs_by_symbol[symbol] = {gvar, prim_func};
-      if (!full_graph_plan && planned_symbols.count(symbol) != 0) {
+      if (planned_symbols.count(symbol) != 0) {
         auto rewritten = MaybeBuildCanonicalFunction(prim_func);
         TVM_FFI_CHECK(rewritten.has_value(), ValueError)
             << "BuildTyphoonGraph could not build canonical segment for `" << symbol << "`";
@@ -2610,10 +2524,8 @@ Pass BuildTyphoonGraph() {
       for (const PlannedLayer& layer : planned_layers) {
         TVM_FFI_CHECK(typhoon_funcs_by_symbol.count(layer.symbol) != 0, ValueError)
             << "BuildTyphoonGraph plan references missing symbol `" << layer.symbol << "`";
-        if (!full_graph_plan) {
-          TVM_FFI_CHECK(layer_templates.count(layer.symbol) != 0, ValueError)
-              << "BuildTyphoonGraph plan references untemplated symbol `" << layer.symbol << "`";
-        }
+        TVM_FFI_CHECK(layer_templates.count(layer.symbol) != 0, ValueError)
+            << "BuildTyphoonGraph plan references untemplated symbol `" << layer.symbol << "`";
       }
 
       for (const auto& [symbol, entry] : typhoon_funcs_by_symbol) {
@@ -2623,19 +2535,15 @@ Pass BuildTyphoonGraph() {
         PrimFunc rewritten = entry.second;
         auto* n = rewritten.CopyOnWrite();
         if (symbol == final_symbol) {
-          if (full_graph_plan) {
-            n->body = SeqStmt(BuildReplayWholeGraphStmts(graph_id, entry.second, planned_layers));
-          } else {
-            ffi::Array<Stmt> stmts{
-                CaptureCallStmt(graph_id, planned_layer_ids_by_symbol.at(symbol), entry.second)};
-            for (const Stmt& stmt :
-                 BuildPlannedWholeGraphStmts(graph_id, planned_layers, layer_templates,
-                                             placement_regions, layer_operand_bindings,
-                                             placement_region_by_storage)) {
-              stmts.push_back(stmt);
-            }
-            n->body = SeqStmt(stmts);
+          ffi::Array<Stmt> stmts{
+              CaptureCallStmt(graph_id, planned_layer_ids_by_symbol.at(symbol), entry.second)};
+          for (const Stmt& stmt :
+               BuildPlannedWholeGraphStmts(graph_id, planned_layers, layer_templates,
+                                           placement_regions, layer_operand_bindings,
+                                           placement_region_by_storage)) {
+            stmts.push_back(stmt);
           }
+          n->body = SeqStmt(stmts);
         } else {
           n->body = CaptureCallStmt(graph_id, planned_layer_ids_by_symbol.at(symbol), entry.second);
         }
@@ -2648,50 +2556,9 @@ Pass BuildTyphoonGraph() {
   return CreateModulePass(pass_func, 0, "tirx.BuildTyphoonGraph", {});
 }
 
-Pass CompactTyphoonWholeGraph() {
-  auto pass_func = [](IRModule mod, PassContext ctx) {
-    auto resnet_plan = mod->GetAttr<ffi::String>("typhoon_resnet18_plan");
-    if (!resnet_plan.has_value()) {
-      return mod;
-    }
-    std::string plan = resnet_plan.value();
-    if (IsFullGraphRecognitionPlan(plan)) {
-      return mod;
-    }
-
-    std::vector<PlannedLayer> planned_layers = ParsePlannedLayers(plan);
-    TVM_FFI_CHECK(!planned_layers.empty(), ValueError)
-        << "CompactTyphoonWholeGraph requires planned layers";
-    std::string final_symbol = planned_layers.back().symbol;
-
-    IRModule updated = mod;
-    for (const auto& [gvar, base_func] : mod->functions) {
-      const auto* func = base_func.as<PrimFuncNode>();
-      if (func == nullptr) {
-        continue;
-      }
-      PrimFunc prim_func = ffi::GetRef<PrimFunc>(func);
-      auto target = prim_func->GetAttr<Target>(tvm::attr::kTarget);
-      if (!target.defined() || target.value()->kind->name != "typhoon") {
-        continue;
-      }
-      if (!MatchesPlannedSymbol(GlobalSymbol(prim_func), final_symbol)) {
-        continue;
-      }
-      auto* n = prim_func.CopyOnWrite();
-      n->body = SeqStmt(BuildReplayWholeGraphStmts(0, prim_func, planned_layers));
-      updated->Add(gvar, prim_func, true);
-      break;
-    }
-    return updated;
-  };
-  return CreateModulePass(pass_func, 0, "tirx.CompactTyphoonWholeGraph", {});
-}
-
 TVM_FFI_STATIC_INIT_BLOCK() {
   namespace refl = tvm::ffi::reflection;
   refl::GlobalDef().def("tirx.transform.BuildTyphoonGraph", BuildTyphoonGraph);
-  refl::GlobalDef().def("tirx.transform.CompactTyphoonWholeGraph", CompactTyphoonWholeGraph);
 }
 
 }  // namespace transform

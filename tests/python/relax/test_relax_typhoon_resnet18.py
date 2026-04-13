@@ -16,7 +16,6 @@
 # under the License.
 
 import json
-import re
 from types import SimpleNamespace
 
 import numpy as np
@@ -40,94 +39,26 @@ from tests.python.relax.typhoon_resnet18_test_utils import (
 )
 
 
-_FFI_DEF_RE = re.compile(
-    r"__tvm_ffi_([A-Za-z0-9_]+)\(void\* self_handle, void\* args, int32_t num_args, void\* result\) \{"
-)
-
-
-def _extract_ffi_function_bodies(source):
-    matches = list(_FFI_DEF_RE.finditer(source))
-    return {
-        match.group(1): source[match.start() : matches[index + 1].start() if index + 1 < len(matches) else len(source)]
-        for index, match in enumerate(matches)
-    }
-
-
-def _count_marker_in_ffi_bodies(source, marker):
-    return sum(body.count(marker) for body in _extract_ffi_function_bodies(source).values())
-
-
-def _assert_graphized_function_has_no_host_fallback(body, *required_markers, require_submission=True):
-    if require_submission:
-        assert "TVMTyphoonGraphBegin" in body
-        assert "TVMTyphoonSubmitGraph" in body
-        assert "TVMTyphoonWaitGraph" in body
-    for marker in required_markers:
-        assert marker in body
-    assert "for (" not in body
-
-
-def _assert_resnet18_typhoon_source_contract(source):
-    ffi_bodies = _extract_ffi_function_bodies(source)
-    assert _count_marker_in_ffi_bodies(source, "TVMTyphoonGraphBegin") == 1
-    assert _count_marker_in_ffi_bodies(source, "TVMTyphoonSubmitGraph") == 1
-    assert _count_marker_in_ffi_bodies(source, "TVMTyphoonWaitGraph") == 1
-    graph_entry_bodies = [body for body in ffi_bodies.values() if "TVMTyphoonGraphBegin" in body]
-    assert len(graph_entry_bodies) == 1
-    _assert_graphized_function_has_no_host_fallback(graph_entry_bodies[0])
-    capture_only_funcs = ["conv2d", "conv2d1", "conv2d4", "mean", "matmul"]
-    for name in capture_only_funcs:
-        assert name in ffi_bodies
-        assert "TVMTyphoonCaptureCallPlanned" in ffi_bodies[name]
-        assert "TVMTyphoonGraphBegin" not in ffi_bodies[name]
-        assert "TVMTyphoonAddReshapeTask" not in ffi_bodies[name]
-        assert "TVMTyphoonAddMatmulTask" not in ffi_bodies[name]
-        assert "for (" not in ffi_bodies[name]
-
-    assert "add9" in ffi_bodies
-    assert "TVMTyphoonReplayWholeGraphBegin" in ffi_bodies["add9"]
-    assert "TVMTyphoonReplayCapturedLayer" in ffi_bodies["add9"]
-    assert (
-        "TVMTyphoonCapturePackedArgsPlanned" in ffi_bodies["add9"]
-        or "TVMTyphoonCaptureCallPlanned" in ffi_bodies["add9"]
-    )
-    assert "TVMTyphoonAddReshapeTask" not in ffi_bodies["add9"]
-    assert "TVMTyphoonAddMatmulTask" not in ffi_bodies["add9"]
-    assert "TVMTyphoonSubmitGraph" in ffi_bodies["add9"]
-    assert "TVMTyphoonWaitGraph" in ffi_bodies["add9"]
-    assert "for (" not in ffi_bodies["add9"]
+def _assert_fused_typhoon_source_contract(source):
+    assert "TVMTyphoonGraphBegin" in source
+    assert "TVMTyphoonSubmitGraph" in source
+    assert "TVMTyphoonWaitGraph" in source
+    assert "TVMTyphoonReplayWholeGraphBegin" not in source
+    assert "TVMTyphoonReplayCapturedLayer" not in source
+    assert "fused_conv2d_add_relu" in source
+    assert "fused_matmul_add9" in source
 
 
 def test_relax_resnet18_compiles_to_typhoon_graph():
     model = load_canonical_resnet18_model()
     mod = import_canonical_resnet18_relax_module(model)
-    ex, source = build_canonical_resnet18_vm_executable(mod, use_fused_pipeline=False)
+    ex, source = build_canonical_resnet18_vm_executable(mod)
     assert isinstance(ex, vm_build.VMExecutable)
-    _assert_resnet18_typhoon_source_contract(source)
+    _assert_fused_typhoon_source_contract(source)
+
 
 
 def test_relax_resnet18_runs_in_typhoon_simulator():
-    model = load_canonical_resnet18_model()
-    mod = import_canonical_resnet18_relax_module(model)
-    feed_dict = build_canonical_resnet18_feed_dict(model)
-    reset = tvm.get_global_func("runtime.typhoon.testing_reset", allow_missing=True)
-    get_trace = tvm.get_global_func("runtime.typhoon_get_last_trace_json", allow_missing=True)
-    assert reset is not None
-    assert get_trace is not None
-    reset()
-    executable, source = build_canonical_resnet18_vm_executable(mod, use_fused_pipeline=False)
-    output = run_canonical_resnet18_on_typhoon(feed_dict, mod, executable=executable)
-    ref = run_canonical_resnet18_reference_onnxruntime(feed_dict, model)
-    trace = json.loads(get_trace())
-    _assert_resnet18_typhoon_source_contract(source)
-    assert trace
-    assert all("layer_id" in record for record in trace)
-    assert any(record["layer_id"] == 68 for record in trace)
-    assert any(record["layer_id"] == 69 for record in trace)
-    tvm.testing.assert_allclose(output, ref, rtol=1e-4, atol=1e-4)
-
-
-def test_relax_resnet18_compact_replay_reduces_dma_and_makespan():
     model = load_canonical_resnet18_model()
     mod = import_canonical_resnet18_relax_module(model)
     feed_dict = build_canonical_resnet18_feed_dict(model)
@@ -139,22 +70,50 @@ def test_relax_resnet18_compact_replay_reduces_dma_and_makespan():
     assert get_stats is not None
 
     reset()
-    executable, _ = build_canonical_resnet18_vm_executable(mod, use_fused_pipeline=False)
+    executable, source = build_canonical_resnet18_vm_executable(mod)
+    output = run_canonical_resnet18_on_typhoon(feed_dict, mod, executable=executable)
+    ref = run_canonical_resnet18_reference_onnxruntime(feed_dict, model)
+    trace = json.loads(get_trace())
+    stats = json.loads(get_stats())
+
+    _assert_fused_typhoon_source_contract(source)
+    assert trace
+    assert stats["total"] > 0
+    assert stats["dma"] > 0
+    tvm.testing.assert_allclose(output, ref, rtol=1e-4, atol=1e-4)
+
+
+
+def test_relax_resnet18_fused_graph_keeps_dma_and_makespan_compact():
+    model = load_canonical_resnet18_model()
+    mod = import_canonical_resnet18_relax_module(model)
+    feed_dict = build_canonical_resnet18_feed_dict(model)
+    reset = tvm.get_global_func("runtime.typhoon.testing_reset", allow_missing=True)
+    get_trace = tvm.get_global_func("runtime.typhoon_get_last_trace_json", allow_missing=True)
+    get_stats = tvm.get_global_func("runtime.typhoon_get_last_graph_stats_json", allow_missing=True)
+    assert reset is not None
+    assert get_trace is not None
+    assert get_stats is not None
+
+    reset()
+    executable, _ = build_canonical_resnet18_vm_executable(mod)
     output = run_canonical_resnet18_on_typhoon(feed_dict, mod, executable=executable)
     ref = run_canonical_resnet18_reference_onnxruntime(feed_dict, model)
     trace = json.loads(get_trace())
     stats = json.loads(get_stats())
 
     tvm.testing.assert_allclose(output, ref, rtol=1e-4, atol=1e-4)
-    assert stats["dma"] < 4853, stats
-    assert max(record["end_time"] for record in trace) < 24290606, trace[-1]
+    assert stats["total"] <= 32, stats
+    assert stats["dma"] <= 20, stats
+    assert max(record["end_time"] for record in trace) < 100000, trace[-1]
+
 
 
 def test_run_canonical_resnet18_on_typhoon_reuses_prebuilt_executable(monkeypatch):
     model = load_canonical_resnet18_model()
     mod = import_canonical_resnet18_relax_module(model)
     feed_dict = build_canonical_resnet18_feed_dict(model)
-    exe, _ = build_canonical_resnet18_vm_executable(mod, use_fused_pipeline=False)
+    exe, _ = build_canonical_resnet18_vm_executable(mod)
 
     def _unexpected_rebuild(*args, **kwargs):
         raise AssertionError("run_canonical_resnet18_on_typhoon should reuse the provided executable")
@@ -166,6 +125,7 @@ def test_run_canonical_resnet18_on_typhoon_reuses_prebuilt_executable(monkeypatc
 
     output = run_canonical_resnet18_on_typhoon(feed_dict, mod, executable=exe)
     assert output.shape == (1, 1000)
+
 
 
 def test_run_canonical_resnet18_on_typhoon_jits_with_c_compiler(monkeypatch):
@@ -213,6 +173,7 @@ def test_run_canonical_resnet18_on_typhoon_jits_with_c_compiler(monkeypatch):
     assert calls["vm_mod"] == "jitted-runtime-module"
 
 
+
 def test_typhoon_resnet18_test_utils_loads_canonical_model():
     from tests.python.relax.typhoon_resnet18_test_utils import load_canonical_resnet18_model
 
@@ -220,11 +181,13 @@ def test_typhoon_resnet18_test_utils_loads_canonical_model():
     assert model is not None
 
 
-def test_typhoon_resnet18_vm_tir_module_uses_fused_pipeline_by_default():
+
+def test_typhoon_resnet18_vm_tir_module_uses_fused_graph_pipeline():
     mod = build_canonical_resnet18_vm_tir_module()
     names = [gvar.name_hint for gvar in mod.get_global_vars()]
     assert "fused_conv2d_add_relu" in names
     assert "fused_matmul_add9" in names
+
 
 
 def test_relax_resnet18_default_typhoon_build_uses_fused_graph_kernels():
@@ -232,9 +195,8 @@ def test_relax_resnet18_default_typhoon_build_uses_fused_graph_kernels():
     mod = import_canonical_resnet18_relax_module(model)
     ex, source = build_canonical_resnet18_vm_executable(mod)
     assert isinstance(ex, vm_build.VMExecutable)
-    assert "TVMTyphoonGraphBegin" in source
-    assert "TVMTyphoonReplayWholeGraphBegin" not in source
-    assert "fused_conv2d_add_relu" in source
+    _assert_fused_typhoon_source_contract(source)
+
 
 
 def test_relax_typhoon_reports_first_mismatch_context():
@@ -249,6 +211,7 @@ def test_relax_typhoon_reports_first_mismatch_context():
     assert "first mismatch" in message.lower()
     assert "stage3_block1" in message
     assert "42" in message
+
 
 
 def test_relax_typhoon_onnxruntime_failure_surfaces_context():
